@@ -81,4 +81,4 @@ if prompt := st.chat_input("¿Qué quieres saber de tus datos?"):
                     st.code(sql_usado)
                     st.dataframe(df_datos)
             else:
-                st.error(sql_us
+                st.error(sql_usado)
