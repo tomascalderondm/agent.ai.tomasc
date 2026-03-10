@@ -31,8 +31,8 @@ def chatbot_eterno(pregunta_usuario):
     intentos = 0
     while intentos < 2:
         try:
-            # Aquí cambiamos a gemini-1.5-flash (el modelo estable)
-            res_sql = genai_client.models.generate_content(model='gemini-1.5-flash', contents=prompt_sql)
+            # AQUÍ CAMBIAMOS A GEMINI-2.5-FLASH
+            res_sql = genai_client.models.generate_content(model='gemini-2.5-flash', contents=prompt_sql)
             query_limpio = res_sql.text.strip().replace('```sql', '').replace('```', '')
             resultado_df = bq_client.query(query_limpio).to_dataframe()
             return resultado_df, query_limpio
@@ -71,8 +71,8 @@ if prompt := st.chat_input("¿Qué quieres saber de tus datos?"):
                 historial = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.messages[-3:]])
                 final_prompt = f"Historial: {historial}\nPregunta: {prompt}\nDatos: {df_datos.to_string()}\nResponde como consultor senior."
                 
-                # Aquí también cambiamos a gemini-1.5-flash
-                res_final = genai_client.models.generate_content(model='gemini-1.5-flash', contents=final_prompt)
+                # AQUÍ TAMBIÉN CAMBIAMOS A GEMINI-2.5-FLASH
+                res_final = genai_client.models.generate_content(model='gemini-2.5-flash', contents=final_prompt)
                 
                 respuesta = res_final.text
                 st.markdown(respuesta)
@@ -81,4 +81,4 @@ if prompt := st.chat_input("¿Qué quieres saber de tus datos?"):
                     st.code(sql_usado)
                     st.dataframe(df_datos)
             else:
-                st.error(sql_usado)
+                st.error(sql_us
