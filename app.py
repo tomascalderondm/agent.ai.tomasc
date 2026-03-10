@@ -4,7 +4,7 @@ from google import genai
 from google.oauth2 import service_account
 
 # --- CONFIGURACIÓN DE SEGURIDAD (LEER DESDE STREAMLIT SECRETS) ---
-PROJECT_ID = "data-marketing-360"
+PROJECT_ID = "base-de-datos-489323"
 DATASET_VISTA = "campo_noble_ai"
 
 # 1. Cargar Credenciales de Google Cloud
