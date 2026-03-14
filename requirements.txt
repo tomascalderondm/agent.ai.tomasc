@@ -1,6 +1,5 @@
 streamlit
-google-cloud-bigquery
-google-genai
-google-auth
 pandas
-db-dtypes
+google-cloud-bigquery
+google-auth
+google-genai
