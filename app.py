@@ -34,26 +34,25 @@ ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", 
 
 # ============================================================
 # MAPA DE VERDAD OFICIAL
+# SOLO TABLAS QUE EXISTEN HOY
 # ============================================================
 
 MAPA_VERDAD: Dict[str, str] = {
     # CORE
     "fact_pedidos": f"{PROJECT_ID}.{CORE_DATASET}.fact_pedidos",
     "fact_pedido_productos": f"{PROJECT_ID}.{CORE_DATASET}.fact_pedido_productos",
+    "fact_pedidos_limpios": f"{PROJECT_ID}.{CORE_DATASET}.fact_pedidos_limpios",
     "dim_clientes": f"{PROJECT_ID}.{CORE_DATASET}.dim_clientes",
     "bridge_cliente_identidades": f"{PROJECT_ID}.{CORE_DATASET}.bridge_cliente_identidades",
 
     # AI
     "perfil_clientes_360": f"{PROJECT_ID}.{AI_DATASET}.perfil_clientes_360",
-    "resumen_clientes": f"{PROJECT_ID}.{AI_DATASET}.resumen_clientes",
-    "resumen_cliente_producto": f"{PROJECT_ID}.{AI_DATASET}.resumen_cliente_producto",
-    "resumen_productos_retencion": f"{PROJECT_ID}.{AI_DATASET}.resumen_productos_retencion",
     "resumen_ventas_periodo": f"{PROJECT_ID}.{AI_DATASET}.resumen_ventas_periodo",
     "resumen_productos_ventas": f"{PROJECT_ID}.{AI_DATASET}.resumen_productos_ventas",
+    "resumen_productos_retencion": f"{PROJECT_ID}.{AI_DATASET}.resumen_productos_retencion",
     "resumen_geografia": f"{PROJECT_ID}.{AI_DATASET}.resumen_geografia",
     "afinidad_productos": f"{PROJECT_ID}.{AI_DATASET}.afinidad_productos",
     "auditoria_datos": f"{PROJECT_ID}.{AI_DATASET}.auditoria_datos",
-    "action_center": f"{PROJECT_ID}.{AI_DATASET}.action_center",
 }
 
 ALLOWED_TABLES = set(MAPA_VERDAD.values())
@@ -99,13 +98,6 @@ def resumir_dataframe_para_prompt(df: pd.DataFrame, max_rows: int = 60) -> str:
     return df.head(max_rows).to_string(index=False)
 
 
-def formatear_moneda_clp(valor) -> str:
-    try:
-        return f"${valor:,.0f} CLP".replace(",", ".")
-    except Exception:
-        return str(valor)
-
-
 def es_pregunta_medios_o_inversion(pregunta_usuario: str) -> bool:
     q = pregunta_usuario.lower()
     keywords = [
@@ -117,35 +109,49 @@ def es_pregunta_medios_o_inversion(pregunta_usuario: str) -> bool:
     return any(x in q for x in keywords)
 
 
+def es_pregunta_informe(pregunta_usuario: str) -> bool:
+    q = pregunta_usuario.lower()
+    patrones = [
+        "hazme un informe",
+        "quiero un informe",
+        "reporte",
+        "resumen ejecutivo",
+        "informe ejecutivo",
+        "analisis mensual",
+        "análisis mensual",
+        "informe de enero",
+        "informe de febrero",
+    ]
+    return any(p in q for p in patrones)
+
+
 def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
     q = pregunta_usuario.lower()
-
     prioridades = []
 
-    if any(x in q for x in ["venta", "ventas", "mes", "año", "anio", "comparar", "facturación", "facturacion", "ticket"]):
+    if any(x in q for x in ["venta", "ventas", "mes", "año", "anio", "comparar", "facturación", "facturacion", "ticket", "ingresos"]):
         prioridades += [
             MAPA_VERDAD["resumen_ventas_periodo"],
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["fact_pedidos"],
         ]
 
-    if any(x in q for x in ["cliente", "clientes", "ltv", "segmento", "recurrente", "nuevo", "riesgo", "inactividad", "churn", "reactivar", "winback"]):
+    if any(x in q for x in ["cliente", "clientes", "ltv", "segmento", "recurrente", "nuevo", "riesgo", "inactividad", "churn", "reactivar"]):
         prioridades += [
             MAPA_VERDAD["perfil_clientes_360"],
-            MAPA_VERDAD["resumen_clientes"],
             MAPA_VERDAD["dim_clientes"],
+            MAPA_VERDAD["fact_pedidos"],
         ]
 
     if any(x in q for x in ["producto", "productos", "retención", "retencion", "recompra", "gancho", "afinidad", "bundle", "mix", "canasta"]):
         prioridades += [
             MAPA_VERDAD["resumen_productos_retencion"],
-            MAPA_VERDAD["resumen_cliente_producto"],
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["afinidad_productos"],
             MAPA_VERDAD["fact_pedido_productos"],
         ]
 
-    if any(x in q for x in ["comuna", "geo", "geografía", "geografia", "ciudad", "zona", "territorio", "region", "región"]):
+    if any(x in q for x in ["comuna", "geo", "geografía", "geografia", "ciudad", "zona", "territorio", "región", "region"]):
         prioridades += [
             MAPA_VERDAD["resumen_geografia"],
             MAPA_VERDAD["dim_clientes"],
@@ -157,64 +163,61 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["auditoria_datos"],
         ]
 
-    if any(x in q for x in ["acción", "accion", "oportunidad", "winback", "fidelizar", "meta ads"]):
-        prioridades += [
-            MAPA_VERDAD["action_center"],
-        ]
-
     if any(x in q for x in [
-        "inversión", "inversion", "medios", "paid media", "google ads", "presupuesto",
-        "budget", "roas", "cpa", "cac", "performance", "retargeting", "prospecting",
-        "audiencia", "audiencias", "escalar", "bidding"
+        "inversión", "inversion", "medios", "paid media", "google ads", "meta ads",
+        "presupuesto", "budget", "roas", "cpa", "cac", "performance",
+        "retargeting", "prospecting", "audiencia", "audiencias", "escalar"
     ]):
         prioridades += [
-            MAPA_VERDAD["action_center"],
             MAPA_VERDAD["resumen_ventas_periodo"],
             MAPA_VERDAD["perfil_clientes_360"],
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["resumen_productos_retencion"],
             MAPA_VERDAD["resumen_geografia"],
-            MAPA_VERDAD["resumen_clientes"],
+            MAPA_VERDAD["afinidad_productos"],
+        ]
+
+    if es_pregunta_informe(pregunta_usuario):
+        prioridades += [
+            MAPA_VERDAD["resumen_ventas_periodo"],
+            MAPA_VERDAD["perfil_clientes_360"],
+            MAPA_VERDAD["resumen_productos_ventas"],
+            MAPA_VERDAD["resumen_productos_retencion"],
+            MAPA_VERDAD["resumen_geografia"],
+            MAPA_VERDAD["auditoria_datos"],
         ]
 
     if not prioridades:
         prioridades = [
-            MAPA_VERDAD["resumen_clientes"],
             MAPA_VERDAD["resumen_ventas_periodo"],
-            MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["perfil_clientes_360"],
+            MAPA_VERDAD["resumen_productos_ventas"],
         ]
 
     return list(dict.fromkeys(prioridades))
+
+
+def filtrar_tablas_existentes(tablas_objetivo: List[str]) -> List[str]:
+    disponibles = []
+
+    for table_fq in tablas_objetivo:
+        try:
+            bq_client.get_table(table_fq)
+            disponibles.append(table_fq)
+        except Exception:
+            continue
+
+    return disponibles
 
 
 def obtener_esquemas_tablas(tablas_objetivo: List[str]) -> Dict[str, List[Tuple[str, str]]]:
     esquemas: Dict[str, List[Tuple[str, str]]] = {}
 
     for table_fq in tablas_objetivo:
-        project_id, dataset_id, table_name = table_fq.split(".")
-
-        query = f"""
-        SELECT
-          column_name,
-          data_type
-        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
-        WHERE table_name = @table_name
-        ORDER BY ordinal_position
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("table_name", "STRING", table_name)
-            ],
-            use_query_cache=True,
-            maximum_bytes_billed=MAX_BYTES_BILLED,
-        )
-
         try:
-            df = bq_client.query(query, job_config=job_config).to_dataframe()
-            if not df.empty:
-                esquemas[table_fq] = list(zip(df["column_name"].tolist(), df["data_type"].tolist()))
+            table = bq_client.get_table(table_fq)
+            if table.schema:
+                esquemas[table_fq] = [(field.name, field.field_type) for field in table.schema]
         except Exception:
             continue
 
@@ -292,6 +295,17 @@ def ejecutar_query_segura(query: str) -> pd.DataFrame:
     return bq_client.query(query, job_config=job_config).result().to_dataframe()
 
 
+def diagnosticar_tablas() -> Dict[str, bool]:
+    estado = {}
+    for alias, table_fq in MAPA_VERDAD.items():
+        try:
+            bq_client.get_table(table_fq)
+            estado[alias] = True
+        except Exception:
+            estado[alias] = False
+    return estado
+
+
 # ============================================================
 # PROMPTS NOBLEBOTAI
 # ============================================================
@@ -359,13 +373,15 @@ Piensa como un director de estrategia, medios y growth:
 2. Usa tablas CORE solo cuando la pregunta requiera granularidad histórica o transaccional.
 3. Si la pregunta es sobre ventas por período, evolución, estacionalidad, ticket o comparación temporal, prioriza `resumen_ventas_periodo`.
 4. Si la pregunta es sobre productos que más venden, aportan o concentran ingresos, prioriza `resumen_productos_ventas`.
-5. Si la pregunta es sobre recompra, retención, producto ancla, producto gancho o canasta, prioriza `resumen_productos_retencion`, `resumen_cliente_producto` y `afinidad_productos`.
-6. Si la pregunta es sobre clientes, segmentos, LTV, recurrencia, reactivación, riesgo o churn, prioriza `perfil_clientes_360`, `resumen_clientes` y `dim_clientes`.
+5. Si la pregunta es sobre recompra, retención, producto ancla, producto gancho o canasta, prioriza `resumen_productos_retencion` y `afinidad_productos`.
+6. Si la pregunta es sobre clientes, segmentos, LTV, recurrencia, reactivación, riesgo o churn, prioriza `perfil_clientes_360` y `dim_clientes`.
 7. Si la pregunta es sobre comportamiento de compra detallado, puedes usar `fact_pedidos` y `fact_pedido_productos`.
 8. Si la pregunta es sobre geografía comercial, comunas o regiones, prioriza `resumen_geografia`.
 9. Si la pregunta es sobre calidad de datos o cobertura, prioriza `auditoria_datos`.
-10. Si la pregunta es sobre oportunidades accionables o lectura ejecutiva, prioriza `action_center`.
-11. Si la pregunta es ambigua, elige la ruta más segura, más liviana y más ejecutiva.
+10. Si la pregunta es ambigua, elige la ruta más segura, más liviana y más ejecutiva.
+11. Si el usuario pide un informe, prioriza una consulta ejecutiva agregada antes que detalle transaccional.
+12. Si el usuario pide un informe por meses específicos, filtra explícitamente por esas fechas usando las columnas reales disponibles.
+13. Si no existe una columna mensual explícita, usa una fecha real disponible y agrupa o filtra con EXTRACT.
 
 ## REGLAS TECNICAS OBLIGATORIAS
 1. Responde únicamente con SQL.
@@ -572,21 +588,42 @@ Debes fusionar un diagnóstico interno basado en datos propios con un contraste 
 
 def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -> Tuple[str, pd.DataFrame]:
     tablas_prioritarias = obtener_tablas_prioritarias(pregunta_usuario)
-    esquemas = obtener_esquemas_tablas(tablas_prioritarias)
+    tablas_disponibles = filtrar_tablas_existentes(tablas_prioritarias)
+
+    if not tablas_disponibles:
+        fallback_core = [
+            MAPA_VERDAD["fact_pedidos"],
+            MAPA_VERDAD["fact_pedido_productos"],
+            MAPA_VERDAD["fact_pedidos_limpios"],
+            MAPA_VERDAD["dim_clientes"],
+            MAPA_VERDAD["bridge_cliente_identidades"],
+        ]
+        tablas_disponibles = filtrar_tablas_existentes(fallback_core)
+
+    if not tablas_disponibles:
+        raise ValueError(
+            "No pude encontrar tablas disponibles ni en AI ni en CORE. "
+            "Revisa el BRAND_ID, el proyecto y los permisos de la service account."
+        )
+
+    esquemas = obtener_esquemas_tablas(tablas_disponibles)
 
     if not esquemas:
-        raise ValueError("No pude obtener esquemas reales de las tablas oficiales.")
+        raise ValueError(
+            f"No pude obtener esquemas de las tablas disponibles. Tablas detectadas: {tablas_disponibles}"
+        )
 
     esquemas_texto = formatear_esquemas_para_prompt(esquemas)
 
     error_previo = ""
     ultimo_error = ""
+    ultimo_sql_generado = ""
 
-    for _ in range(MAX_SQL_RETRIES):
+    for intento in range(MAX_SQL_RETRIES):
         prompt_sql = construir_prompt_sql(
             pregunta_usuario=pregunta_usuario,
             historial_contexto=historial_contexto,
-            tablas_prioritarias=tablas_prioritarias,
+            tablas_prioritarias=tablas_disponibles,
             esquemas_texto=esquemas_texto,
             error_previo=error_previo,
         )
@@ -597,10 +634,12 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
         )
 
         query_limpio = limpiar_sql(obtener_texto_modelo(respuesta_sql))
+        ultimo_sql_generado = query_limpio
+
         es_valida, motivo = validar_sql(query_limpio)
 
         if not es_valida:
-            ultimo_error = motivo
+            ultimo_error = f"[Intento {intento + 1}] SQL inválido: {motivo}\n\nSQL generado:\n{query_limpio}"
             error_previo = f"La consulta previa fue inválida. Motivo: {motivo}"
             continue
 
@@ -608,10 +647,10 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
             df = ejecutar_query_segura(query_limpio)
             return query_limpio, df
         except Exception as e:
-            ultimo_error = str(e)
+            ultimo_error = f"[Intento {intento + 1}] Error BigQuery: {str(e)}\n\nSQL generado:\n{query_limpio}"
             error_previo = f"La consulta previa falló en BigQuery. Error: {str(e)}"
 
-    raise ValueError(f"No pude construir una consulta válida tras reintentos. Último error: {ultimo_error}")
+    raise ValueError(ultimo_error or f"No pude construir una consulta válida. Último SQL:\n{ultimo_sql_generado}")
 
 
 def responder_como_noblebot(
@@ -698,7 +737,6 @@ def generar_contraste_externo_medios(
         return texto, urls
 
     except Exception:
-        # Fallback silencioso si el modelo/config grounding no está disponible
         response = genai_client.models.generate_content(
             model=MODEL_MEDIA,
             contents=prompt_media,
@@ -765,6 +803,12 @@ with st.sidebar:
     st.subheader("Mapa de Verdad")
     for alias, fq_table in MAPA_VERDAD.items():
         st.markdown(f"- **{alias}** → `{fq_table}`")
+
+    st.subheader("Estado tablas oficiales")
+    estado_tablas = diagnosticar_tablas()
+    for alias, existe in estado_tablas.items():
+        icono = "✅" if existe else "❌"
+        st.markdown(f"{icono} **{alias}**")
 
     if st.button("Limpiar memoria"):
         st.session_state.messages = []
