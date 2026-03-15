@@ -2,4 +2,6 @@ streamlit
 pandas
 google-cloud-bigquery
 google-auth
-openai
+google-genai
+db-dtypes
+pyarrow
