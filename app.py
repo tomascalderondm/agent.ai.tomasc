@@ -13,7 +13,8 @@ from google.oauth2 import service_account
 # CONFIGURACION BASE
 # ============================================================
 
-PROJECT_ID = "data-marketing-360"
+PROJECT_ID = st.secrets.get("PROJECT_ID", "data-marketing-360")
+LOCATION = st.secrets.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 BRAND_ID = st.secrets.get("BRAND_ID", "campo_noble")
 
 CORE_DATASET = f"{BRAND_ID}_core"
@@ -62,11 +63,24 @@ ALLOWED_TABLES = set(MAPA_VERDAD.values())
 # CREDENCIALES Y CLIENTES
 # ============================================================
 
-creds_dict = st.secrets["gcp_service_account"]
-creds = service_account.Credentials.from_service_account_info(creds_dict)
+creds_dict = dict(st.secrets["gcp_service_account"])
 
-bq_client = bigquery.Client(credentials=creds, project=PROJECT_ID)
-genai_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+creds = service_account.Credentials.from_service_account_info(
+    creds_dict,
+    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+)
+
+bq_client = bigquery.Client(
+    credentials=creds,
+    project=PROJECT_ID,
+)
+
+genai_client = genai.Client(
+    vertexai=True,
+    project=PROJECT_ID,
+    location=LOCATION,
+    credentials=creds,
+)
 
 
 # ============================================================
@@ -793,6 +807,7 @@ if "last_external_urls" not in st.session_state:
 with st.sidebar:
     st.header("Configuración")
     st.markdown(f"**Proyecto:** `{PROJECT_ID}`")
+    st.markdown(f"**Location:** `{LOCATION}`")
     st.markdown(f"**Marca base:** `{BRAND_ID}`")
     st.markdown(f"**Modelo SQL:** `{MODEL_SQL}`")
     st.markdown(f"**Modelo respuesta:** `{MODEL_RESPONSE}`")
