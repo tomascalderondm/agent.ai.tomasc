@@ -101,11 +101,6 @@ def obtener_texto_modelo(response) -> str:
     return getattr(response, "text", "") or ""
 
 
-def construir_contexto_historial(messages: List[Dict[str, str]], max_messages: int = MAX_HISTORY_MESSAGES) -> str:
-    recientes = messages[-max_messages:]
-    return "\n".join([f"{m['role']}: {m['content']}" for m in recientes])
-
-
 def resumir_dataframe_para_prompt(df: pd.DataFrame, max_rows: int = 60) -> str:
     if df.empty:
         return "Sin filas."
@@ -137,6 +132,195 @@ def es_pregunta_informe(pregunta_usuario: str) -> bool:
         "informe de febrero",
     ]
     return any(p in q for p in patrones)
+
+
+def es_followup_de_respuesta_anterior(pregunta_usuario: str) -> bool:
+    q = pregunta_usuario.lower().strip()
+
+    patrones_followup = [
+        "de ese",
+        "de esa",
+        "de esos",
+        "de esas",
+        "ese ranking",
+        "esa tabla",
+        "eso",
+        "esos resultados",
+        "esas comunas",
+        "esas ciudades",
+        "esas ventas",
+        "esos clientes",
+        "profundiza",
+        "ahonda",
+        "explica más",
+        "explica mas",
+        "desarrolla",
+        "compara con",
+        "y en ese caso",
+        "y de ahí",
+        "y de ahi",
+        "de los que me diste",
+        "de lo anterior",
+        "del ranking anterior",
+        "de la respuesta anterior",
+        "de lo que me mostraste",
+        "de lo que dijiste",
+        "de lo que me dijiste",
+        "de eso que viste",
+        "de eso que encontraste",
+        "siguiendo con eso",
+        "sobre eso",
+        "en ese caso",
+        "en ese escenario",
+        "cual de esos",
+        "cuál de esos",
+        "cual de estas",
+        "cuál de estas",
+        "cual sería mejor",
+        "cuál sería mejor",
+        "cual pesa más",
+        "cuál pesa más",
+        "el segundo",
+        "la segunda",
+        "el primero",
+        "la primera",
+        "el top 3",
+        "el top 5",
+        "el ranking",
+        "ese top",
+        "ese resultado",
+        "esa respuesta",
+    ]
+
+    if any(p in q for p in patrones_followup):
+        return True
+
+    palabras_cortas = q.split()
+    if len(palabras_cortas) <= 12:
+        indicadores = [
+            "cual", "cuál", "ese", "esa", "eso", "esas", "esos",
+            "mismo", "misma", "tambien", "también", "ahora",
+            "entonces", "y", "pero"
+        ]
+        if any(x in palabras_cortas for x in indicadores):
+            return True
+
+    return False
+
+
+def detectar_followup_semantico_con_modelo(
+    pregunta_usuario: str,
+    ultima_pregunta: str,
+    ultima_respuesta: str,
+    ultimo_sql: str = "",
+    ultimo_df_texto: str = "",
+) -> bool:
+    if not ultima_pregunta and not ultima_respuesta:
+        return False
+
+    prompt = f"""
+Evalúa si la NUEVA_PREGUNTA depende del contexto anterior o si puede entenderse totalmente sola.
+
+Responde únicamente con una de estas dos opciones:
+- FOLLOWUP
+- NUEVA
+
+Criterio:
+- Responde FOLLOWUP si la nueva pregunta se refiere, aunque sea de forma implícita, a rankings, tablas, hallazgos, comunas, clientes, períodos, comparaciones, conclusiones o resultados mencionados antes.
+- Responde FOLLOWUP aunque no use pronombres obvios como "eso", "ese ranking" o "lo anterior", si semánticamente está continuando la conversación.
+- Responde NUEVA solo si cambia claramente de tema o puede resolverse sin depender del contexto previo.
+
+ULTIMA_PREGUNTA:
+{ultima_pregunta}
+
+ULTIMA_RESPUESTA:
+{ultima_respuesta}
+
+ULTIMO_SQL:
+{ultimo_sql}
+
+ULTIMOS_DATOS:
+{ultimo_df_texto}
+
+NUEVA_PREGUNTA:
+{pregunta_usuario}
+"""
+
+    try:
+        response = genai_client.models.generate_content(
+            model=MODEL_RESPONSE,
+            contents=prompt,
+        )
+        texto = obtener_texto_modelo(response).strip().upper()
+        return "FOLLOWUP" in texto
+    except Exception:
+        return False
+
+
+def debe_usar_contexto_previo(pregunta_usuario: str) -> bool:
+    if es_followup_de_respuesta_anterior(pregunta_usuario):
+        return True
+
+    last_user_question = st.session_state.get("last_user_question", "")
+    last_answer = st.session_state.get("last_answer", "")
+    last_sql = st.session_state.get("last_sql", "")
+    last_df = st.session_state.get("last_df", None)
+
+    last_df_texto = ""
+    if last_df is not None and not last_df.empty:
+        last_df_texto = last_df.head(20).to_string(index=False)
+
+    return detectar_followup_semantico_con_modelo(
+        pregunta_usuario=pregunta_usuario,
+        ultima_pregunta=last_user_question,
+        ultima_respuesta=last_answer,
+        ultimo_sql=last_sql,
+        ultimo_df_texto=last_df_texto,
+    )
+
+
+def resumir_contexto_anterior_para_followup() -> str:
+    partes = []
+
+    last_user_question = st.session_state.get("last_user_question", "")
+    last_sql = st.session_state.get("last_sql", "")
+    last_answer = st.session_state.get("last_answer", "")
+    last_df = st.session_state.get("last_df", None)
+
+    if last_user_question:
+        partes.append(f"ULTIMA_PREGUNTA_USUARIO:\n{last_user_question}")
+
+    if last_answer:
+        partes.append(f"ULTIMA_RESPUESTA_ASISTENTE:\n{last_answer}")
+
+    if last_sql:
+        partes.append(f"ULTIMO_SQL_USADO:\n{last_sql}")
+
+    if last_df is not None and not last_df.empty:
+        partes.append(
+            "ULTIMOS_DATOS_TABULARES:\n" +
+            last_df.head(20).to_string(index=False)
+        )
+
+    return "\n\n".join(partes)
+
+
+def construir_contexto_historial(
+    messages: List[Dict[str, str]],
+    pregunta_actual: str,
+    max_messages: int = MAX_HISTORY_MESSAGES,
+) -> str:
+    recientes = messages[-max_messages:]
+    historial_chat = "\n".join([f"{m['role']}: {m['content']}" for m in recientes])
+
+    contexto_extra = ""
+    if debe_usar_contexto_previo(pregunta_actual):
+        contexto_extra = resumir_contexto_anterior_para_followup()
+
+    if contexto_extra:
+        return f"{historial_chat}\n\nCONTEXTO_ESTRUCTURADO_PREVIO:\n{contexto_extra}"
+
+    return historial_chat
 
 
 def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
@@ -412,6 +596,10 @@ Piensa como un director de estrategia, medios y growth:
 12. Si del historial existe una referencia clara y útil, puedes reutilizarla.
 13. Si una tabla agregada resuelve la pregunta, no escales a una tabla más pesada.
 14. Evita scans innecesarios.
+15. Si la pregunta del usuario hace referencia a una respuesta anterior con expresiones como "ese ranking", "esas comunas", "eso", "lo anterior" o similares, debes usar el CONTEXTO_ESTRUCTURADO_PREVIO para inferir correctamente a qué resultado se refiere.
+16. Si el follow-up depende de un ranking, tabla o resultado anterior, continúa la lógica analítica sobre ese contexto en vez de reinterpretar la pregunta como una consulta completamente nueva.
+17. Incluso si la pregunta no contiene pronombres explícitos, si semánticamente depende de la respuesta previa, debes tratarla como continuación del análisis anterior.
+18. Si existe ambigüedad moderada entre una pregunta nueva y un follow-up, prioriza el contexto conversacional previo antes de asumir un cambio total de tema.
 
 ## FORMATO DE SALIDA
 - Entrega solo SQL puro.
@@ -804,6 +992,13 @@ if "last_external_contrast" not in st.session_state:
 if "last_external_urls" not in st.session_state:
     st.session_state.last_external_urls = []
 
+if "last_user_question" not in st.session_state:
+    st.session_state.last_user_question = ""
+
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = ""
+
+
 with st.sidebar:
     st.header("Configuración")
     st.markdown(f"**Proyecto:** `{PROJECT_ID}`")
@@ -831,6 +1026,8 @@ with st.sidebar:
         st.session_state.last_df = None
         st.session_state.last_external_contrast = ""
         st.session_state.last_external_urls = []
+        st.session_state.last_user_question = ""
+        st.session_state.last_answer = ""
         st.rerun()
 
 for message in st.session_state.messages:
@@ -846,7 +1043,11 @@ if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas
     with st.chat_message("assistant"):
         with st.spinner("NobleBotAI está consultando las tablas oficiales..."):
             try:
-                memoria_reciente = construir_contexto_historial(st.session_state.messages)
+                memoria_reciente = construir_contexto_historial(
+                    st.session_state.messages,
+                    prompt
+                )
+
                 sql_usado, df_datos = generar_sql_con_reintentos(prompt, memoria_reciente)
 
                 respuesta_interna = responder_como_noblebot(
@@ -875,8 +1076,11 @@ if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas
 
                 st.markdown(respuesta_final)
                 st.session_state.messages.append({"role": "assistant", "content": respuesta_final})
+
+                st.session_state.last_user_question = prompt
+                st.session_state.last_answer = respuesta_final
                 st.session_state.last_sql = sql_usado
-                st.session_state.last_df = df_datos
+                st.session_state.last_df = df_datos.copy()
                 st.session_state.last_external_contrast = contraste_externo
                 st.session_state.last_external_urls = external_urls
 
