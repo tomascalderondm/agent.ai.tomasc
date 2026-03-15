@@ -2,4 +2,4 @@ streamlit
 pandas
 google-cloud-bigquery
 google-auth
-google-genai
+openai
