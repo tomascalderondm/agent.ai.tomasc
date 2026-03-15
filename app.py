@@ -1,12 +1,29 @@
+import io
 import re
-from typing import Dict, List, Tuple
+import tempfile
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import plotly.express as px
+import plotly.io as pio
 import streamlit as st
 from google import genai
-from google.genai import types
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Image,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 
 # ============================================================
@@ -20,7 +37,7 @@ BRAND_ID = st.secrets.get("BRAND_ID", "campo_noble")
 CORE_DATASET = f"{BRAND_ID}_core"
 AI_DATASET = f"{BRAND_ID}_ai"
 
-MAX_ROWS_RESULT = 200
+MAX_ROWS_RESULT = 300
 MAX_HISTORY_MESSAGES = 6
 MAX_SQL_RETRIES = 2
 MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
@@ -29,15 +46,11 @@ MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-2.5-flash")
 MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-2.5-flash")
 MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-2.5-flash")
 
-ENABLE_MEDIA_GROUNDING = st.secrets.get("ENABLE_MEDIA_GROUNDING", True)
 ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", True)
 
 
 # ============================================================
 # MAPA DE VERDAD OFICIAL
-# SOLO TABLAS QUE EXISTEN HOY
-# NOTA: resumen_geografia fue removida del flujo por problemas
-# de calidad / consistencia en la dimensión geográfica.
 # ============================================================
 
 MAPA_VERDAD: Dict[str, str] = {
@@ -48,13 +61,24 @@ MAPA_VERDAD: Dict[str, str] = {
     "dim_clientes": f"{PROJECT_ID}.{CORE_DATASET}.dim_clientes",
     "bridge_cliente_identidades": f"{PROJECT_ID}.{CORE_DATASET}.bridge_cliente_identidades",
 
-    # AI
+    # AI general
     "perfil_clientes_360": f"{PROJECT_ID}.{AI_DATASET}.perfil_clientes_360",
     "resumen_ventas_periodo": f"{PROJECT_ID}.{AI_DATASET}.resumen_ventas_periodo",
     "resumen_productos_ventas": f"{PROJECT_ID}.{AI_DATASET}.resumen_productos_ventas",
     "resumen_productos_retencion": f"{PROJECT_ID}.{AI_DATASET}.resumen_productos_retencion",
     "afinidad_productos": f"{PROJECT_ID}.{AI_DATASET}.afinidad_productos",
     "auditoria_datos": f"{PROJECT_ID}.{AI_DATASET}.auditoria_datos",
+
+    # AI geografia canónica
+    "geo_catalogo_chile_normalizado": f"{PROJECT_ID}.{AI_DATASET}.geo_catalogo_chile_normalizado",
+    "geo_aliases": f"{PROJECT_ID}.{AI_DATASET}.geo_aliases",
+    "geo_fuentes_raw": f"{PROJECT_ID}.{AI_DATASET}.geo_fuentes_raw",
+    "geo_fuentes_limpias": f"{PROJECT_ID}.{AI_DATASET}.geo_fuentes_limpias",
+    "geo_resolucion_comunas": f"{PROJECT_ID}.{AI_DATASET}.geo_resolucion_comunas",
+    "geo_no_resueltos": f"{PROJECT_ID}.{AI_DATASET}.geo_no_resueltos",
+    "geo_inteligencia_base": f"{PROJECT_ID}.{AI_DATASET}.geo_inteligencia_base",
+    "geo_filtros_expandibles": f"{PROJECT_ID}.{AI_DATASET}.geo_filtros_expandibles",
+    "resumen_geografia": f"{PROJECT_ID}.{AI_DATASET}.resumen_geografia",
 }
 
 ALLOWED_TABLES = set(MAPA_VERDAD.values())
@@ -85,15 +109,13 @@ genai_client = genai.Client(
 
 
 # ============================================================
-# UTILIDADES
+# UTILIDADES GENERALES
 # ============================================================
 
 def limpiar_sql(texto: str) -> str:
     if not texto:
         return ""
-    texto = texto.strip()
-    texto = texto.replace("```sql", "").replace("```", "").strip()
-    return texto
+    return texto.strip().replace("```sql", "").replace("```", "").strip()
 
 
 def obtener_texto_modelo(response) -> str:
@@ -103,7 +125,7 @@ def obtener_texto_modelo(response) -> str:
 
 
 def resumir_dataframe_para_prompt(df: pd.DataFrame, max_rows: int = 60) -> str:
-    if df.empty:
+    if df is None or df.empty:
         return "Sin filas."
     return df.head(max_rows).to_string(index=False)
 
@@ -135,62 +157,39 @@ def es_pregunta_informe(pregunta_usuario: str) -> bool:
     return any(p in q for p in patrones)
 
 
+def es_solicitud_grafico(pregunta_usuario: str) -> bool:
+    q = pregunta_usuario.lower().strip()
+    patrones = [
+        "grafica", "gráfica", "grafícame", "graficame", "grafico", "gráfico",
+        "hazme un grafico", "hazme un gráfico", "chart", "plot", "barra",
+        "barras", "linea", "línea", "lineas", "líneas", "visualiza", "visualizame"
+    ]
+    return any(p in q for p in patrones)
+
+
+def es_solicitud_pdf(pregunta_usuario: str) -> bool:
+    q = pregunta_usuario.lower().strip()
+    patrones = [
+        "pdf", "descargable", "informe pdf", "reporte pdf", "genera pdf",
+        "exporta pdf", "descargar informe", "descargar pdf"
+    ]
+    return any(p in q for p in patrones)
+
+
 def es_followup_de_respuesta_anterior(pregunta_usuario: str) -> bool:
     q = pregunta_usuario.lower().strip()
 
     patrones_followup = [
-        "de ese",
-        "de esa",
-        "de esos",
-        "de esas",
-        "ese ranking",
-        "esa tabla",
-        "eso",
-        "esos resultados",
-        "esas comunas",
-        "esas ciudades",
-        "esas ventas",
-        "esos clientes",
-        "profundiza",
-        "ahonda",
-        "explica más",
-        "explica mas",
-        "desarrolla",
-        "compara con",
-        "y en ese caso",
-        "y de ahí",
-        "y de ahi",
-        "de los que me diste",
-        "de lo anterior",
-        "del ranking anterior",
-        "de la respuesta anterior",
-        "de lo que me mostraste",
-        "de lo que dijiste",
-        "de lo que me dijiste",
-        "de eso que viste",
-        "de eso que encontraste",
-        "siguiendo con eso",
-        "sobre eso",
-        "en ese caso",
-        "en ese escenario",
-        "cual de esos",
-        "cuál de esos",
-        "cual de estas",
-        "cuál de estas",
-        "cual sería mejor",
-        "cuál sería mejor",
-        "cual pesa más",
-        "cuál pesa más",
-        "el segundo",
-        "la segunda",
-        "el primero",
-        "la primera",
-        "el top 3",
-        "el top 5",
-        "el ranking",
-        "ese top",
-        "ese resultado",
-        "esa respuesta",
+        "de ese", "de esa", "de esos", "de esas", "ese ranking", "esa tabla", "eso",
+        "esos resultados", "esas comunas", "esas ciudades", "esas ventas", "esos clientes",
+        "profundiza", "ahonda", "explica más", "explica mas", "desarrolla", "compara con",
+        "y en ese caso", "y de ahí", "y de ahi", "de los que me diste", "de lo anterior",
+        "del ranking anterior", "de la respuesta anterior", "de lo que me mostraste",
+        "de lo que dijiste", "de lo que me dijiste", "siguiendo con eso", "sobre eso",
+        "en ese caso", "en ese escenario", "cual de esos", "cuál de esos",
+        "cual de estas", "cuál de estas", "el segundo", "la segunda",
+        "el primero", "la primera", "el top 3", "el top 5", "el ranking",
+        "ese top", "ese resultado", "esa respuesta", "vitacura?", "y vitacura?"
     ]
 
     if any(p in q for p in patrones_followup):
@@ -200,8 +199,7 @@ def es_followup_de_respuesta_anterior(pregunta_usuario: str) -> bool:
     if len(palabras_cortas) <= 12:
         indicadores = [
             "cual", "cuál", "ese", "esa", "eso", "esas", "esos",
-            "mismo", "misma", "tambien", "también", "ahora",
-            "entonces", "y", "pero"
+            "mismo", "misma", "tambien", "también", "ahora", "entonces", "y", "pero"
         ]
         if any(x in palabras_cortas for x in indicadores):
             return True
@@ -246,7 +244,6 @@ ULTIMOS_DATOS:
 NUEVA_PREGUNTA:
 {pregunta_usuario}
 """
-
     try:
         response = genai_client.models.generate_content(
             model=MODEL_RESPONSE,
@@ -298,10 +295,7 @@ def resumir_contexto_anterior_para_followup() -> str:
         partes.append(f"ULTIMO_SQL_USADO:\n{last_sql}")
 
     if last_df is not None and not last_df.empty:
-        partes.append(
-            "ULTIMOS_DATOS_TABULARES:\n" +
-            last_df.head(20).to_string(index=False)
-        )
+        partes.append("ULTIMOS_DATOS_TABULARES:\n" + last_df.head(20).to_string(index=False))
 
     return "\n\n".join(partes)
 
@@ -325,148 +319,20 @@ def construir_contexto_historial(
 
 
 # ============================================================
-# GEOGRAFIA: NORMALIZACION LOCAL + APOYO GEMINI
+# TABLAS PRIORITARIAS
 # ============================================================
-
-def contiene_geografia(pregunta_usuario: str) -> bool:
-    q = pregunta_usuario.lower()
-    keywords = [
-        "comuna", "comunas", "region", "región", "provincia", "provincias",
-        "ciudad", "ciudades", "zona", "territorio", "rm", "metropolitana",
-        "santiago", "providencia", "las condes", "vitacura", "maipu", "maipú",
-        "ñuñoa", "nunoa", "la reina", "lo barnechea", "puente alto", "talca",
-        "maule", "biobio", "bio bio", "concepcion", "concepción"
-    ]
-    return any(k in q for k in keywords)
-
-
-def normalizar_terminos_geograficos_local(pregunta_usuario: str) -> Dict[str, List[str]]:
-    q = pregunta_usuario.lower()
-
-    alias_region = {
-        "rm": "METROPOLITANA DE SANTIAGO",
-        "region metropolitana": "METROPOLITANA DE SANTIAGO",
-        "región metropolitana": "METROPOLITANA DE SANTIAGO",
-        "metropolitana de santiago": "METROPOLITANA DE SANTIAGO",
-        "metropolitana": "METROPOLITANA DE SANTIAGO",
-        "maule": "MAULE",
-        "biobio": "BIOBIO",
-        "bio bio": "BIOBIO",
-        "ñuble": "NUBLE",
-        "nuble": "NUBLE",
-    }
-
-    alias_comuna = {
-        "santiago centro": "SANTIAGO",
-        "santiago": "SANTIAGO",
-        "provi": "PROVIDENCIA",
-        "providencia": "PROVIDENCIA",
-        "las condes": "LAS CONDES",
-        "vitacura": "VITACURA",
-        "nunoa": "NUNOA",
-        "ñuñoa": "NUNOA",
-        "maipu": "MAIPU",
-        "maipú": "MAIPU",
-        "la reina": "LA REINA",
-        "lo barnechea": "LO BARNECHEA",
-        "puente alto": "PUENTE ALTO",
-        "talca": "TALCA",
-        "concepcion": "CONCEPCION",
-        "concepción": "CONCEPCION",
-        "san miguel": "SAN MIGUEL",
-        "la florida": "LA FLORIDA",
-        "recoleta": "RECOLETA",
-        "macul": "MACUL",
-        "estacion central": "ESTACION CENTRAL",
-        "estación central": "ESTACION CENTRAL",
-    }
-
-    regiones = []
-    comunas = []
-
-    for k, v in alias_region.items():
-        if k in q:
-            regiones.append(v)
-
-    for k, v in alias_comuna.items():
-        if k in q:
-            comunas.append(v)
-
-    return {
-        "regiones": list(dict.fromkeys(regiones)),
-        "comunas": list(dict.fromkeys(comunas)),
-    }
-
-
-def normalizar_geografia_con_gemini(pregunta_usuario: str) -> str:
-    prompt = f"""
-Extrae y normaliza la intención geográfica del usuario para análisis SQL.
-
-Reglas:
-- Distingue entre comuna, provincia y región.
-- Usa nombres canónicos en mayúscula.
-- Si "Santiago" aparece solo, aclara si probablemente corresponde a comuna o a región metropolitana, pero sin inventar certeza total.
-- Si el usuario dice "Santiago y comunas de esa región", interpreta:
-  - SANTIAGO como comuna cuando aplique a una comuna.
-  - METROPOLITANA DE SANTIAGO como región cuando aplique a una región.
-- No devuelvas SQL.
-- No expliques de más.
-- Responde en texto estructurado breve.
-
-Pregunta:
-{pregunta_usuario}
-"""
-
-    try:
-        response = genai_client.models.generate_content(
-            model=MODEL_RESPONSE,
-            contents=prompt,
-        )
-        return obtener_texto_modelo(response).strip()
-    except Exception:
-        return ""
-
-
-def construir_contexto_geografico_normalizado(pregunta_usuario: str) -> str:
-    if not contiene_geografia(pregunta_usuario):
-        return ""
-
-    local = normalizar_terminos_geograficos_local(pregunta_usuario)
-
-    partes = []
-    if local["regiones"]:
-        partes.append("REGIONES_NORMALIZADAS_LOCAL:\n- " + "\n- ".join(local["regiones"]))
-    if local["comunas"]:
-        partes.append("COMUNAS_NORMALIZADAS_LOCAL:\n- " + "\n- ".join(local["comunas"]))
-
-    usar_gemini = False
-    if not local["regiones"] and not local["comunas"]:
-        usar_gemini = True
-
-    # También usamos Gemini si hay "Santiago" porque es un caso ambiguo.
-    if "santiago" in pregunta_usuario.lower():
-        usar_gemini = True
-
-    if usar_gemini:
-        contexto_gemini = normalizar_geografia_con_gemini(pregunta_usuario)
-        if contexto_gemini:
-            partes.append(f"INTERPRETACION_GEOGRAFICA_GEMINI:\n{contexto_gemini}")
-
-    if not partes:
-        return ""
-
-    return "\n\n".join(partes)
-
 
 def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
     q = pregunta_usuario.lower()
-    prioridades = []
+    prioridades: List[str] = []
 
     if any(x in q for x in ["venta", "ventas", "mes", "año", "anio", "comparar", "facturación", "facturacion", "ticket", "ingresos"]):
         prioridades += [
             MAPA_VERDAD["resumen_ventas_periodo"],
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["fact_pedidos"],
+            MAPA_VERDAD["geo_inteligencia_base"],
+            MAPA_VERDAD["resumen_geografia"],
         ]
 
     if any(x in q for x in ["cliente", "clientes", "ltv", "segmento", "recurrente", "nuevo", "riesgo", "inactividad", "churn", "reactivar"]):
@@ -474,6 +340,8 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["perfil_clientes_360"],
             MAPA_VERDAD["dim_clientes"],
             MAPA_VERDAD["fact_pedidos"],
+            MAPA_VERDAD["geo_inteligencia_base"],
+            MAPA_VERDAD["resumen_geografia"],
         ]
 
     if any(x in q for x in ["producto", "productos", "retención", "retencion", "recompra", "gancho", "afinidad", "bundle", "mix", "canasta"]):
@@ -482,19 +350,21 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["afinidad_productos"],
             MAPA_VERDAD["fact_pedido_productos"],
+            MAPA_VERDAD["geo_inteligencia_base"],
         ]
 
-    if any(x in q for x in ["comuna", "geo", "geografía", "geografia", "ciudad", "zona", "territorio", "región", "region", "provincia", "provincias"]):
+    if any(x in q for x in ["comuna", "comunas", "ciudad", "ciudades", "provincia", "provincias", "región", "region", "geo", "geografia", "geografía"]):
         prioridades += [
-            MAPA_VERDAD["dim_clientes"],
-            MAPA_VERDAD["fact_pedidos"],
-            MAPA_VERDAD["fact_pedido_productos"],
-            MAPA_VERDAD["perfil_clientes_360"],
+            MAPA_VERDAD["resumen_geografia"],
+            MAPA_VERDAD["geo_inteligencia_base"],
+            MAPA_VERDAD["geo_filtros_expandibles"],
+            MAPA_VERDAD["geo_catalogo_chile_normalizado"],
         ]
 
     if any(x in q for x in ["calidad", "auditoría", "auditoria", "error", "cobertura"]):
         prioridades += [
             MAPA_VERDAD["auditoria_datos"],
+            MAPA_VERDAD["geo_no_resueltos"],
         ]
 
     if any(x in q for x in [
@@ -508,6 +378,7 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["resumen_productos_retencion"],
             MAPA_VERDAD["afinidad_productos"],
+            MAPA_VERDAD["geo_inteligencia_base"],
         ]
 
     if es_pregunta_informe(pregunta_usuario):
@@ -516,7 +387,9 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["perfil_clientes_360"],
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["resumen_productos_retencion"],
+            MAPA_VERDAD["resumen_geografia"],
             MAPA_VERDAD["auditoria_datos"],
+            MAPA_VERDAD["geo_inteligencia_base"],
         ]
 
     if not prioridades:
@@ -531,20 +404,17 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
 
 def filtrar_tablas_existentes(tablas_objetivo: List[str]) -> List[str]:
     disponibles = []
-
     for table_fq in tablas_objetivo:
         try:
             bq_client.get_table(table_fq)
             disponibles.append(table_fq)
         except Exception:
             continue
-
     return disponibles
 
 
 def obtener_esquemas_tablas(tablas_objetivo: List[str]) -> Dict[str, List[Tuple[str, str]]]:
     esquemas: Dict[str, List[Tuple[str, str]]] = {}
-
     for table_fq in tablas_objetivo:
         try:
             table = bq_client.get_table(table_fq)
@@ -552,7 +422,6 @@ def obtener_esquemas_tablas(tablas_objetivo: List[str]) -> Dict[str, List[Tuple[
                 esquemas[table_fq] = [(field.name, field.field_type) for field in table.schema]
         except Exception:
             continue
-
     return esquemas
 
 
@@ -562,28 +431,6 @@ def formatear_esquemas_para_prompt(esquemas: Dict[str, List[Tuple[str, str]]]) -
         columnas = ", ".join([f"{col} ({dtype})" for col, dtype in cols])
         bloques.append(f"- {tabla}: {columnas}")
     return "\n".join(bloques)
-
-
-def extraer_urls_grounding(response) -> List[str]:
-    urls: List[str] = []
-
-    try:
-        candidates = getattr(response, "candidates", None) or []
-        for candidate in candidates:
-            grounding_metadata = getattr(candidate, "grounding_metadata", None)
-            if grounding_metadata is None:
-                continue
-
-            grounding_chunks = getattr(grounding_metadata, "grounding_chunks", None) or []
-            for chunk in grounding_chunks:
-                web_info = getattr(chunk, "web", None)
-                uri = getattr(web_info, "uri", None) if web_info else None
-                if uri and uri not in urls:
-                    urls.append(uri)
-    except Exception:
-        pass
-
-    return urls[:8]
 
 
 def validar_sql(query: str) -> Tuple[bool, str]:
@@ -639,7 +486,7 @@ def diagnosticar_tablas() -> Dict[str, bool]:
 
 
 # ============================================================
-# PROMPTS NOBLEBOTAI
+# PROMPTS
 # ============================================================
 
 def construir_prompt_sql(
@@ -647,34 +494,17 @@ def construir_prompt_sql(
     historial_contexto: str,
     tablas_prioritarias: List[str],
     esquemas_texto: str,
-    contexto_geografico: str = "",
     error_previo: str = "",
 ) -> str:
     tablas_texto = "\n".join([f"- {t}" for t in tablas_prioritarias])
 
     return f"""
-Eres NobleBotAI, motor de consulta SQL de BigQuery para inteligencia comercial, performance y marketing 360 de una agencia de marketing y medios.
+Eres NobleBotAI, motor de consulta SQL de BigQuery para inteligencia comercial, performance y marketing 360.
 
 ## OBJETIVO
 Debes escribir una única consulta SQL válida, segura y eficiente para responder la pregunta del usuario usando exclusivamente el Mapa de Verdad oficial.
 
-Tu trabajo es responder preguntas de negocio con foco en:
-- inversión
-- performance comercial
-- clientes
-- recurrencia
-- recompra
-- churn
-- ticket
-- LTV
-- mix de productos
-- geografía
-- audiencias
-- oportunidades de activación, retención y win-back
-
 ## MAPA DE VERDAD OFICIAL
-Puedes usar únicamente estas tablas:
-
 {chr(10).join([f"- {v}" for v in MAPA_VERDAD.values()])}
 
 ## TABLAS PRIORITARIAS PARA ESTA PREGUNTA
@@ -682,9 +512,6 @@ Puedes usar únicamente estas tablas:
 
 ## ESQUEMAS REALES DISPONIBLES
 {esquemas_texto}
-
-## CONTEXTO GEOGRAFICO NORMALIZADO
-{contexto_geografico}
 
 ## MEMORIA OPERATIVA
 {historial_contexto}
@@ -695,31 +522,19 @@ Puedes usar únicamente estas tablas:
 ## ERROR PREVIO A CORREGIR
 {error_previo}
 
-## CRITERIO DE NEGOCIO
-Piensa como un director de estrategia, medios y growth:
-- prioriza tablas que permitan responder con la mayor claridad ejecutiva y el menor costo de consulta.
-- si la pregunta es ejecutiva, devuelve agregados accionables antes que detalle transaccional.
-- si la pregunta es operativa, entrega el detalle mínimo útil.
-- si la pregunta apunta a inversión o medios, busca señales de eficiencia, concentración de valor, fuga, recurrencia, potencial de reactivación y redistribución presupuestaria.
-- no compliques la consulta si una tabla AI ya responde la pregunta.
-- si no existen métricas de paid media en las tablas oficiales, no las inventes.
-
-## REGLAS DE PRIORIZACION
-1. Usa primero tablas resumen AI cuando sean suficientes para responder.
-2. Usa tablas CORE solo cuando la pregunta requiera granularidad histórica o transaccional.
-3. Si la pregunta es sobre ventas por período, evolución, estacionalidad, ticket o comparación temporal, prioriza `resumen_ventas_periodo`.
-4. Si la pregunta es sobre productos que más venden, aportan o concentran ingresos, prioriza `resumen_productos_ventas`.
-5. Si la pregunta es sobre recompra, retención, producto ancla, producto gancho o canasta, prioriza `resumen_productos_retencion` y `afinidad_productos`.
-6. Si la pregunta es sobre clientes, segmentos, LTV, recurrencia, reactivación, riesgo o churn, prioriza `perfil_clientes_360` y `dim_clientes`.
-7. Si la pregunta es sobre comportamiento de compra detallado, puedes usar `fact_pedidos` y `fact_pedido_productos`.
-8. Si la pregunta es sobre geografía comercial, comunas, provincias, ciudades o regiones, prioriza `dim_clientes`, `fact_pedidos` y `fact_pedido_productos`.
-9. Si la pregunta es sobre calidad de datos o cobertura, prioriza `auditoria_datos`.
-10. Si la pregunta es ambigua, elige la ruta más segura, más liviana y más ejecutiva.
-11. Si el usuario pide un informe, prioriza una consulta ejecutiva agregada antes que detalle transaccional.
-12. Si el usuario pide un informe por meses específicos, filtra explícitamente por esas fechas usando las columnas reales disponibles.
-13. Si no existe una columna mensual explícita, usa una fecha real disponible y agrupa o filtra con EXTRACT.
-14. La tabla de resumen geográfico agregada no debe usarse para construir consultas, aunque exista en el entorno.
-15. Si la pregunta combina geografía + tiempo + clientes nuevos + ranking de productos, prioriza tablas CORE con fechas reales y no tablas resumen agregadas.
+## REGLAS DE NEGOCIO
+- prioriza tablas AI cuando resuelvan la pregunta con claridad.
+- usa CORE solo si la pregunta requiere granularidad real.
+- si la pregunta es geográfica, resuélvela usando la capa geográfica canónica.
+- si el usuario pregunta por región o provincia, no filtres texto libremente en las tablas core.
+- si el usuario pregunta por región, expande a comunas usando `geo_filtros_expandibles`.
+- si el usuario pregunta por provincia, expande a comunas usando `geo_filtros_expandibles`.
+- si el usuario pregunta por comuna, puedes filtrar directamente por `comuna_canonica` o `comuna_principal` según la tabla AI.
+- para análisis geográficos transaccionales, prioriza `geo_inteligencia_base`.
+- para rankings y agregados rápidos por geografía, prioriza `resumen_geografia`.
+- nunca vuelvas a usar columnas geográficas crudas del core como lógica final de filtro si existe equivalente canónico en AI.
+- si el follow-up depende de una respuesta anterior, continúa sobre ese contexto.
+- si la pregunta parece ambigua, elige la ruta más segura y ejecutiva.
 
 ## REGLAS TECNICAS OBLIGATORIAS
 1. Responde únicamente con SQL.
@@ -732,21 +547,11 @@ Piensa como un director de estrategia, medios y growth:
 8. Usa alias legibles.
 9. Si la pregunta pide ranking, incluye ORDER BY.
 10. Si la pregunta pide top o detalle abierto, aplica un LIMIT razonable.
-11. Si la pregunta pide una búsqueda por nombre de cliente sin email exacto, puedes usar LIKE sobre nombre.
-12. Si del historial existe una referencia clara y útil, puedes reutilizarla.
-13. Si una tabla agregada resuelve la pregunta, no escales a una tabla más pesada.
-14. Evita scans innecesarios.
-15. Si la pregunta del usuario hace referencia a una respuesta anterior con expresiones como "ese ranking", "esas comunas", "eso", "lo anterior" o similares, debes usar el CONTEXTO_ESTRUCTURADO_PREVIO para inferir correctamente a qué resultado se refiere.
-16. Si el follow-up depende de un ranking, tabla o resultado anterior, continúa la lógica analítica sobre ese contexto en vez de reinterpretar la pregunta como una consulta completamente nueva.
-17. Incluso si la pregunta no contiene pronombres explícitos, si semánticamente depende de la respuesta previa, debes tratarla como continuación del análisis anterior.
-18. Si existe ambigüedad moderada entre una pregunta nueva y un follow-up, prioriza el contexto conversacional previo antes de asumir un cambio total de tema.
-19. Si existe CONTEXTO GEOGRAFICO NORMALIZADO, úsalo como fuente principal para decidir filtros geográficos.
-20. No reinterpretar libremente la geografía del usuario si ya fue normalizada antes.
-21. Distingue explícitamente entre comuna, ciudad, provincia y región usando los nombres reales de las tablas.
-22. No asumas que "Santiago" equivale automáticamente a "METROPOLITANA DE SANTIAGO"; usa el contexto geográfico normalizado.
-23. Si el usuario pide "Santiago y comunas de esa región", interpreta a SANTIAGO como comuna y a METROPOLITANA DE SANTIAGO como región cuando corresponda al contexto.
-24. Para análisis anuales por geografía, no uses únicamente tablas agregadas si no contienen una columna anual explícita.
-25. Si la ubicación viene con errores de escritura o alias, apóyate en el CONTEXTO GEOGRAFICO NORMALIZADO para usar la forma canónica más probable.
+11. Si del historial existe una referencia clara y útil, puedes reutilizarla.
+12. Si una tabla agregada resuelve la pregunta, no escales a una tabla más pesada.
+13. Si la pregunta del usuario hace referencia a una respuesta anterior como "ese ranking", "eso", "lo anterior" o similares, debes usar el CONTEXTO_ESTRUCTURADO_PREVIO para inferir correctamente a qué resultado se refiere.
+14. Si la pregunta es por región o provincia, la unidad analítica final sigue siendo la comuna, y luego agregas.
+15. Evita scans innecesarios.
 
 ## FORMATO DE SALIDA
 - Entrega solo SQL puro.
@@ -763,22 +568,10 @@ def construir_prompt_respuesta(
     num_filas: int,
 ) -> str:
     return f"""
-Eres NobleBotAI, asistente de inteligencia comercial, performance y marketing 360 para una agencia de marketing y medios.
+Eres NobleBotAI, asistente de inteligencia comercial, performance y marketing 360.
 
 ## OBJETIVO
-Debes transformar resultados tabulares en una respuesta ejecutiva, clara, precisa, accionable y orientada a negocio.
-
-Debes pensar como un estratega senior de agencia:
-- performance
-- inversión
-- retención
-- recompra
-- mix de productos
-- segmentación
-- geografía comercial
-- reactivación
-- oportunidades de medios
-- eficiencia de crecimiento
+Transforma resultados tabulares en una respuesta ejecutiva, clara, precisa y accionable.
 
 ## TONO
 - Ejecutivo
@@ -787,41 +580,22 @@ Debes pensar como un estratega senior de agencia:
 - Profesional
 - Humano
 - Basado en evidencia
-- Nunca robótico
-- Nunca inflado
-- Nunca vendedor de humo
 
 ## REGLAS
 1. Responde siempre en español.
 2. Empieza con: "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽."
 3. Luego sigue con: "Consulté en las tablas oficiales y aquí tienes el resultado..."
 4. Abre con el hallazgo principal.
-5. Luego explica por qué ese hallazgo importa para negocio, inversión o performance.
-6. Si corresponde, interpreta en lógica de marketing 360:
-   - adquisición
-   - conversión
-   - recurrencia
-   - recompra
-   - retención
-   - riesgo
-   - geografía
-   - mix de productos
-   - concentración de ventas
-   - oportunidad de reactivación
-7. Si hay cifras monetarias, preséntalas como CLP.
-8. Si hay pocos datos, dilo con naturalidad, sin sonar defensivo.
-9. No inventes información ni métricas que no estén respaldadas por los datos.
-10. Si la evidencia es limitada, dilo explícitamente.
-11. Cierra siempre con una recomendación concreta, priorizada y accionable.
-12. Cuando sea útil, estructura la respuesta en:
+5. Si corresponde, interpreta implicancias de negocio.
+6. Si hay cifras monetarias, preséntalas como CLP.
+7. No inventes métricas.
+8. Si la evidencia es limitada, dilo.
+9. Cierra con una recomendación concreta.
+10. Cuando sea útil, estructura la respuesta en:
    - Diagnóstico
    - Qué significa
    - Riesgo u oportunidad
    - Próximo paso
-13. Distingue claramente entre:
-   - evidencia interna,
-   - benchmark o lineamiento externo,
-   - recomendación estratégica.
 
 ## CONTEXTO DE CONVERSACION
 {historial_contexto}
@@ -837,97 +611,6 @@ Debes pensar como un estratega senior de agencia:
 
 ## DATOS
 {datos_texto}
-"""
-
-
-def construir_prompt_contraste_medios(
-    pregunta_usuario: str,
-    historial_contexto: str,
-    resumen_diagnostico_interno: str,
-    datos_texto: str,
-) -> str:
-    return f"""
-Eres NobleBotAI, estratega senior de marketing y medios para una agencia de performance.
-
-## OBJETIVO
-Debes contrastar un diagnóstico interno de negocio con buenas prácticas recientes y lineamientos públicos de marketing digital, inversión y medios.
-
-## REGLAS CRITICAS
-1. No contradigas los datos internos sin evidencia.
-2. Distingue siempre entre:
-   - lo demostrado por los datos internos,
-   - lo respaldado por fuentes externas recientes,
-   - y lo recomendado estratégicamente.
-3. No inventes métricas de canal que no existen en la data interna.
-4. Si faltan métricas de paid media, habla de hipótesis y criterios de asignación, no de certezas operativas.
-5. Prioriza temas de:
-   - inversión
-   - bidding
-   - valor de conversión
-   - retención
-   - audiencias
-   - expansión geográfica
-   - concentración de ventas
-   - riesgo de dependencia
-   - reactivación
-   - eficiencia comercial
-6. Si el contraste externo no agrega valor, dilo.
-7. Responde en español.
-8. Sé ejecutivo, concreto y útil para una agencia.
-
-## ESTRUCTURA OBLIGATORIA
-1. Contraste externo
-2. Qué valida o tensiona del diagnóstico interno
-3. Recomendación de inversión / medios priorizada
-4. Advertencias o límites de evidencia
-
-## CONTEXTO
-{historial_contexto}
-
-## PREGUNTA DEL USUARIO
-{pregunta_usuario}
-
-## DIAGNOSTICO INTERNO
-{resumen_diagnostico_interno}
-
-## DATOS RESUMIDOS
-{datos_texto}
-"""
-
-
-def construir_prompt_fusion_final(
-    pregunta_usuario: str,
-    respuesta_interna: str,
-    contraste_externo: str,
-) -> str:
-    return f"""
-Eres NobleBotAI, asistente de inteligencia comercial, performance y marketing 360 para una agencia de marketing y medios.
-
-## OBJETIVO
-Debes fusionar un diagnóstico interno basado en datos propios con un contraste externo basado en fuentes públicas recientes.
-
-## REGLAS
-1. Responde siempre en español.
-2. Empieza con: "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽."
-3. Luego sigue con: "Consulté en las tablas oficiales y aquí tienes el resultado..."
-4. Separa con claridad:
-   - Diagnóstico interno
-   - Contraste externo
-   - Recomendación
-5. Si el contraste externo valida el diagnóstico, dilo.
-6. Si lo tensiona, dilo con precisión.
-7. No inventes métricas.
-8. Si faltan datos de medios reales, aclara que la recomendación es estratégica y no una auditoría de canal completa.
-9. Mantén tono ejecutivo, accionable y orientado a inversión.
-
-## PREGUNTA
-{pregunta_usuario}
-
-## RESPUESTA INTERNA
-{respuesta_interna}
-
-## CONTRASTE EXTERNO
-{contraste_externo}
 """
 
 
@@ -950,20 +633,13 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
         tablas_disponibles = filtrar_tablas_existentes(fallback_core)
 
     if not tablas_disponibles:
-        raise ValueError(
-            "No pude encontrar tablas disponibles ni en AI ni en CORE. "
-            "Revisa el BRAND_ID, el proyecto y los permisos de la service account."
-        )
+        raise ValueError("No pude encontrar tablas disponibles. Revisa el proyecto, datasets y permisos.")
 
     esquemas = obtener_esquemas_tablas(tablas_disponibles)
-
     if not esquemas:
-        raise ValueError(
-            f"No pude obtener esquemas de las tablas disponibles. Tablas detectadas: {tablas_disponibles}"
-        )
+        raise ValueError(f"No pude obtener esquemas de las tablas disponibles. Tablas detectadas: {tablas_disponibles}")
 
     esquemas_texto = formatear_esquemas_para_prompt(esquemas)
-    contexto_geografico = construir_contexto_geografico_normalizado(pregunta_usuario)
 
     error_previo = ""
     ultimo_error = ""
@@ -975,7 +651,6 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
             historial_contexto=historial_contexto,
             tablas_prioritarias=tablas_disponibles,
             esquemas_texto=esquemas_texto,
-            contexto_geografico=contexto_geografico,
             error_previo=error_previo,
         )
 
@@ -988,7 +663,6 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
         ultimo_sql_generado = query_limpio
 
         es_valida, motivo = validar_sql(query_limpio)
-
         if not es_valida:
             ultimo_error = f"[Intento {intento + 1}] SQL inválido: {motivo}\n\nSQL generado:\n{query_limpio}"
             error_previo = f"La consulta previa fue inválida. Motivo: {motivo}"
@@ -1014,8 +688,8 @@ def responder_como_noblebot(
         return (
             "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽.\n\n"
             "Consulté en las tablas oficiales y aquí tienes el resultado: no encontré filas que calcen exactamente con esa búsqueda.\n\n"
-            "La lectura de negocio no es que no exista oportunidad, sino que el filtro actual está demasiado estrecho o no coincide con la forma en que la señal está guardada en el modelo.\n\n"
-            "Recomendación inmediata: conviene reformular la búsqueda por período, cliente, producto, comuna, segmento o una variante del nombre para capturar mejor la oportunidad comercial."
+            "La lectura de negocio no es que no exista oportunidad, sino que el filtro actual está demasiado estrecho o no coincide con la forma en que la señal está guardada.\n\n"
+            "Recomendación inmediata: conviene reformular la búsqueda por período, comuna, región, provincia, cliente, producto o segmento."
         )
 
     datos_texto = resumir_dataframe_para_prompt(df_datos)
@@ -1038,88 +712,199 @@ def responder_como_noblebot(
         texto = (
             "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽.\n\n"
             "Consulté en las tablas oficiales y aquí tienes el resultado.\n\n"
-            "Ya recuperé correctamente los datos, pero la redacción final salió vacía. "
-            "El hallazgo sigue disponible en el SQL y en la tabla de resultados."
+            "Recuperé correctamente los datos, pero la redacción final salió vacía. El hallazgo sigue disponible en el SQL y en la tabla."
         )
 
     return texto
 
 
-def generar_contraste_externo_medios(
-    pregunta_usuario: str,
-    historial_contexto: str,
-    respuesta_interna: str,
-    df_datos: pd.DataFrame,
-) -> Tuple[str, List[str]]:
-    if not ENABLE_EXTERNAL_CORROBORATION:
-        return "", []
+# ============================================================
+# GRAFICOS ON-DEMAND
+# ============================================================
 
-    datos_texto = resumir_dataframe_para_prompt(df_datos, max_rows=40)
-    prompt_media = construir_prompt_contraste_medios(
-        pregunta_usuario=pregunta_usuario,
-        historial_contexto=historial_contexto,
-        resumen_diagnostico_interno=respuesta_interna,
-        datos_texto=datos_texto,
+def elegir_columnas_para_grafico(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], str]:
+    if df is None or df.empty:
+        return None, None, "bar"
+
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    all_cols = df.columns.tolist()
+
+    # Prioridad de Y
+    preferencias_y = [
+        "ventas_totales_clp", "venta_clp", "ventas", "total", "ingresos",
+        "clientes_unicos", "clientes", "pedidos_totales", "pedidos",
+        "ticket_promedio_clp", "ticket"
+    ]
+    y_col = None
+    for pref in preferencias_y:
+        for col in numeric_cols:
+            if pref in col.lower():
+                y_col = col
+                break
+        if y_col:
+            break
+    if not y_col and numeric_cols:
+        y_col = numeric_cols[0]
+
+    # Prioridad de X
+    x_col = None
+    preferencias_x = [
+        "comuna", "provincia", "region", "anio", "año", "mes",
+        "fecha", "producto", "segmento", "cliente"
+    ]
+    for pref in preferencias_x:
+        for col in all_cols:
+            if pref in col.lower() and col != y_col:
+                x_col = col
+                break
+        if x_col:
+            break
+
+    if not x_col:
+        non_numeric = [c for c in all_cols if c not in numeric_cols]
+        if non_numeric:
+            x_col = non_numeric[0]
+        elif len(all_cols) >= 2:
+            x_col = all_cols[0] if all_cols[0] != y_col else all_cols[1]
+
+    chart_type = "bar"
+    if x_col and any(k in x_col.lower() for k in ["fecha", "anio", "año", "mes"]):
+        chart_type = "line"
+
+    return x_col, y_col, chart_type
+
+
+def generar_grafico_desde_dataframe(df: pd.DataFrame, titulo: str):
+    x_col, y_col, chart_type = elegir_columnas_para_grafico(df)
+
+    if not x_col or not y_col:
+        return None, "No encontré columnas adecuadas para graficar."
+
+    df_plot = df.copy().head(50)
+
+    if chart_type == "line":
+        fig = px.line(df_plot, x=x_col, y=y_col, markers=True, title=titulo)
+    else:
+        fig = px.bar(df_plot, x=x_col, y=y_col, title=titulo)
+
+    fig.update_layout(
+        xaxis_title=x_col,
+        yaxis_title=y_col,
+        height=500,
+        margin=dict(l=20, r=20, t=60, b=20),
     )
 
-    if not ENABLE_MEDIA_GROUNDING:
-        response = genai_client.models.generate_content(
-            model=MODEL_MEDIA,
-            contents=prompt_media,
-        )
-        return obtener_texto_modelo(response).strip(), []
-
-    try:
-        grounding_tool = types.Tool(
-            google_search=types.GoogleSearch()
-        )
-        config = types.GenerateContentConfig(
-            tools=[grounding_tool]
-        )
-
-        response = genai_client.models.generate_content(
-            model=MODEL_MEDIA,
-            contents=prompt_media,
-            config=config,
-        )
-
-        texto = obtener_texto_modelo(response).strip()
-        urls = extraer_urls_grounding(response)
-        return texto, urls
-
-    except Exception:
-        response = genai_client.models.generate_content(
-            model=MODEL_MEDIA,
-            contents=prompt_media,
-        )
-        return obtener_texto_modelo(response).strip(), []
-
-
-def fusionar_respuesta_final(
-    pregunta_usuario: str,
-    respuesta_interna: str,
-    contraste_externo: str,
-) -> str:
-    if not contraste_externo.strip():
-        return respuesta_interna
-
-    prompt_fusion = construir_prompt_fusion_final(
-        pregunta_usuario=pregunta_usuario,
-        respuesta_interna=respuesta_interna,
-        contraste_externo=contraste_externo,
-    )
-
-    response = genai_client.models.generate_content(
-        model=MODEL_RESPONSE,
-        contents=prompt_fusion,
-    )
-
-    texto = obtener_texto_modelo(response).strip()
-    return texto or respuesta_interna
+    return fig, ""
 
 
 # ============================================================
-# INTERFAZ STREAMLIT
+# PDF EJECUTIVO
+# ============================================================
+
+def dataframe_to_table_data(df: pd.DataFrame, max_rows: int = 20) -> List[List[str]]:
+    if df is None or df.empty:
+        return [["Sin datos"]]
+
+    df2 = df.head(max_rows).copy()
+    headers = [str(c) for c in df2.columns.tolist()]
+    rows = [[str(v) for v in row] for row in df2.fillna("").astype(str).values.tolist()]
+    return [headers] + rows
+
+
+def build_pdf_bytes() -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=1.5 * cm,
+        leftMargin=1.5 * cm,
+        topMargin=1.2 * cm,
+        bottomMargin=1.2 * cm,
+    )
+
+    styles = getSampleStyleSheet()
+    style_h1 = styles["Heading1"]
+    style_h2 = styles["Heading2"]
+    style_body = styles["BodyText"]
+    style_small = ParagraphStyle(
+        "small",
+        parent=style_body,
+        fontSize=8,
+        leading=10,
+    )
+
+    story = []
+    story.append(Paragraph(f"Informe Ejecutivo - {BRAND_ID}", style_h1))
+    story.append(Paragraph(datetime.now().strftime("%Y-%m-%d %H:%M"), style_small))
+    story.append(Spacer(1, 12))
+
+    report_items = st.session_state.get("report_items", [])
+    charts_for_pdf = st.session_state.get("generated_charts", [])
+
+    if not report_items:
+        story.append(Paragraph("No hay contenido suficiente en la sesión para generar el informe.", style_body))
+    else:
+        for idx, item in enumerate(report_items, start=1):
+            story.append(Paragraph(f"Sección {idx}", style_h2))
+            story.append(Paragraph(f"<b>Pregunta:</b> {item.get('question', '')}", style_body))
+            story.append(Spacer(1, 6))
+            story.append(Paragraph(f"<b>Respuesta ejecutiva:</b><br/>{item.get('answer', '').replace(chr(10), '<br/>')}", style_body))
+            story.append(Spacer(1, 8))
+
+            sql_text = item.get("sql", "")
+            if sql_text:
+                story.append(Paragraph("<b>SQL usado</b>", style_body))
+                story.append(Paragraph(sql_text.replace("\n", "<br/>"), style_small))
+                story.append(Spacer(1, 8))
+
+            df = item.get("df")
+            if df is not None and not df.empty:
+                story.append(Paragraph("<b>Tabla de evidencia</b>", style_body))
+                table_data = dataframe_to_table_data(df, max_rows=12)
+                table = Table(table_data, repeatRows=1)
+                table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAEAEA")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("LEADING", (0, 0), (-1, -1), 8),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]))
+                story.append(table)
+                story.append(Spacer(1, 10))
+
+        if charts_for_pdf:
+            story.append(PageBreak())
+            story.append(Paragraph("Gráficos generados durante la sesión", style_h2))
+            story.append(Spacer(1, 8))
+
+            for chart_item in charts_for_pdf:
+                fig = chart_item.get("fig")
+                title = chart_item.get("title", "Gráfico")
+                if fig is None:
+                    continue
+
+                try:
+                    image_bytes = pio.to_image(fig, format="png", width=1200, height=700, scale=2)
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp.write(image_bytes)
+                        img_path = tmp.name
+
+                    story.append(Paragraph(title, style_body))
+                    story.append(Spacer(1, 6))
+                    story.append(Image(img_path, width=17 * cm, height=10 * cm))
+                    story.append(Spacer(1, 12))
+                except Exception:
+                    story.append(Paragraph(f"{title} (no se pudo incrustar imagen del gráfico en PDF)", style_small))
+                    story.append(Spacer(1, 8))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
+# SESSION STATE
 # ============================================================
 
 st.set_page_config(page_title="NobleBotAI 🐷🐽", layout="wide")
@@ -1135,18 +920,22 @@ if "last_sql" not in st.session_state:
 if "last_df" not in st.session_state:
     st.session_state.last_df = None
 
-if "last_external_contrast" not in st.session_state:
-    st.session_state.last_external_contrast = ""
-
-if "last_external_urls" not in st.session_state:
-    st.session_state.last_external_urls = []
-
 if "last_user_question" not in st.session_state:
     st.session_state.last_user_question = ""
 
 if "last_answer" not in st.session_state:
     st.session_state.last_answer = ""
 
+if "report_items" not in st.session_state:
+    st.session_state.report_items = []
+
+if "generated_charts" not in st.session_state:
+    st.session_state.generated_charts = []
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 with st.sidebar:
     st.header("Configuración")
@@ -1156,8 +945,6 @@ with st.sidebar:
     st.markdown(f"**Modelo SQL:** `{MODEL_SQL}`")
     st.markdown(f"**Modelo respuesta:** `{MODEL_RESPONSE}`")
     st.markdown(f"**Modelo contraste externo:** `{MODEL_MEDIA}`")
-    st.markdown(f"**Contraste externo:** `{ENABLE_EXTERNAL_CORROBORATION}`")
-    st.markdown(f"**Grounding Google Search:** `{ENABLE_MEDIA_GROUNDING}`")
 
     st.subheader("Mapa de Verdad")
     for alias, fq_table in MAPA_VERDAD.items():
@@ -1173,90 +960,142 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.last_sql = ""
         st.session_state.last_df = None
-        st.session_state.last_external_contrast = ""
-        st.session_state.last_external_urls = []
         st.session_state.last_user_question = ""
         st.session_state.last_answer = ""
+        st.session_state.report_items = []
+        st.session_state.generated_charts = []
         st.rerun()
+
+
+# ============================================================
+# RENDER HISTORIAL
+# ============================================================
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas, retención o inversión en medios..."):
+
+# ============================================================
+# FLUJO CHAT
+# ============================================================
+
+if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas, regiones, provincias o inversión en medios..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("NobleBotAI está consultando las tablas oficiales..."):
-            try:
-                memoria_reciente = construir_contexto_historial(
-                    st.session_state.messages,
-                    prompt
-                )
+        try:
+            # --------------------------------------------------------
+            # GRAFICO ON-DEMAND
+            # --------------------------------------------------------
+            if es_solicitud_grafico(prompt):
+                df_chart = st.session_state.get("last_df", None)
 
-                sql_usado, df_datos = generar_sql_con_reintentos(prompt, memoria_reciente)
-
-                respuesta_interna = responder_como_noblebot(
-                    prompt,
-                    memoria_reciente,
-                    sql_usado,
-                    df_datos,
-                )
-
-                contraste_externo = ""
-                external_urls: List[str] = []
-
-                if es_pregunta_medios_o_inversion(prompt):
-                    contraste_externo, external_urls = generar_contraste_externo_medios(
-                        pregunta_usuario=prompt,
-                        historial_contexto=memoria_reciente,
-                        respuesta_interna=respuesta_interna,
-                        df_datos=df_datos,
+                if df_chart is None or df_chart.empty:
+                    respuesta = (
+                        "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽.\n\n"
+                        "No tengo datos previos en memoria para graficar todavía. Primero necesito una respuesta tabular o analítica en esta sesión."
+                    )
+                    st.markdown(respuesta)
+                    st.session_state.messages.append({"role": "assistant", "content": respuesta})
+                else:
+                    fig, error_chart = generar_grafico_desde_dataframe(
+                        df_chart,
+                        f"Gráfico on-demand - {prompt}"
                     )
 
-                respuesta_final = fusionar_respuesta_final(
-                    pregunta_usuario=prompt,
-                    respuesta_interna=respuesta_interna,
-                    contraste_externo=contraste_externo,
-                )
+                    if fig is None:
+                        respuesta = (
+                            "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽.\n\n"
+                            f"No pude construir el gráfico con los datos actuales. Motivo: {error_chart}"
+                        )
+                        st.markdown(respuesta)
+                        st.session_state.messages.append({"role": "assistant", "content": respuesta})
+                    else:
+                        respuesta = (
+                            "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽.\n\n"
+                            "Usé los datos que ya estaban en memoria de la aplicación, sin volver a consultar BigQuery, para que el gráfico sea idéntico a la respuesta anterior."
+                        )
+                        st.markdown(respuesta)
+                        st.plotly_chart(fig, use_container_width=True)
 
-                st.markdown(respuesta_final)
-                st.session_state.messages.append({"role": "assistant", "content": respuesta_final})
+                        st.session_state.generated_charts.append({
+                            "title": f"Gráfico on-demand - {prompt}",
+                            "fig": fig,
+                        })
 
-                st.session_state.last_user_question = prompt
-                st.session_state.last_answer = respuesta_final
-                st.session_state.last_sql = sql_usado
-                st.session_state.last_df = df_datos.copy()
-                st.session_state.last_external_contrast = contraste_externo
-                st.session_state.last_external_urls = external_urls
+                        st.session_state.messages.append({"role": "assistant", "content": respuesta})
 
-                with st.expander("Ver SQL usado"):
-                    st.code(sql_usado, language="sql")
-
-                with st.expander("Ver datos tabulares"):
-                    st.dataframe(df_datos.head(MAX_ROWS_RESULT), use_container_width=True)
-
-                if contraste_externo:
-                    with st.expander("Ver contraste externo de medios"):
-                        st.markdown(contraste_externo)
-
-                        if external_urls:
-                            st.markdown("**Fuentes públicas detectadas:**")
-                            for url in external_urls:
-                                st.markdown(f"- {url}")
-
-            except Exception as e:
-                respuesta_error = (
+            # --------------------------------------------------------
+            # PDF ON-DEMAND
+            # --------------------------------------------------------
+            elif es_solicitud_pdf(prompt):
+                pdf_bytes = build_pdf_bytes()
+                respuesta = (
                     "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽.\n\n"
-                    "Consulté las rutas oficiales, pero hubo un problema técnico al construir o ejecutar la consulta.\n\n"
-                    "La oportunidad sigue ahí; lo que falló fue la ruta de consulta, no la lógica comercial. "
-                    "Prueba con una pregunta más específica por cliente, producto, período, comuna, segmento o tipo de oportunidad."
+                    "Compilé el contenido ya generado durante esta sesión en un informe PDF ejecutivo, sin volver a consultar BigQuery."
                 )
-                st.markdown(respuesta_error)
-                st.session_state.messages.append({"role": "assistant", "content": respuesta_error})
+                st.markdown(respuesta)
+                st.download_button(
+                    label="Descargar informe PDF",
+                    data=pdf_bytes,
+                    file_name=f"informe_{BRAND_ID}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf",
+                )
+                st.session_state.messages.append({"role": "assistant", "content": respuesta})
 
-                with st.expander("Detalle técnico"):
-                    st.code(str(e))
+            # --------------------------------------------------------
+            # FLUJO ANALITICO NORMAL
+            # --------------------------------------------------------
+            else:
+                with st.spinner("NobleBotAI está consultando las tablas oficiales..."):
+                    memoria_reciente = construir_contexto_historial(
+                        st.session_state.messages,
+                        prompt
+                    )
+
+                    sql_usado, df_datos = generar_sql_con_reintentos(prompt, memoria_reciente)
+
+                    respuesta_final = responder_como_noblebot(
+                        prompt,
+                        memoria_reciente,
+                        sql_usado,
+                        df_datos,
+                    )
+
+                    st.markdown(respuesta_final)
+                    st.session_state.messages.append({"role": "assistant", "content": respuesta_final})
+
+                    st.session_state.last_user_question = prompt
+                    st.session_state.last_answer = respuesta_final
+                    st.session_state.last_sql = sql_usado
+                    st.session_state.last_df = df_datos.copy()
+
+                    st.session_state.report_items.append({
+                        "question": prompt,
+                        "answer": respuesta_final,
+                        "sql": sql_usado,
+                        "df": df_datos.copy(),
+                    })
+
+                    with st.expander("Ver SQL usado"):
+                        st.code(sql_usado, language="sql")
+
+                    with st.expander("Ver datos tabulares"):
+                        st.dataframe(df_datos.head(MAX_ROWS_RESULT), use_container_width=True)
+
+        except Exception as e:
+            respuesta_error = (
+                "Hola, soy NobleBotAI, tu asistente IA chancho🐷🐽.\n\n"
+                "Consulté las rutas oficiales, pero hubo un problema técnico al construir o ejecutar la consulta.\n\n"
+                "La oportunidad sigue ahí; lo que falló fue la ruta de consulta, no la lógica comercial. "
+                "Prueba con una pregunta más específica por comuna, provincia, región, producto, período, cliente o segmento."
+            )
+            st.markdown(respuesta_error)
+            st.session_state.messages.append({"role": "assistant", "content": respuesta_error})
+
+            with st.expander("Detalle técnico"):
+                st.code(str(e))
