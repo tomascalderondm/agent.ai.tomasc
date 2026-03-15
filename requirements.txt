@@ -1,5 +1,8 @@
 streamlit
 pandas
+plotly
+kaleido
+reportlab
 google-cloud-bigquery
 google-auth
 google-genai
