@@ -36,6 +36,8 @@ ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", 
 # ============================================================
 # MAPA DE VERDAD OFICIAL
 # SOLO TABLAS QUE EXISTEN HOY
+# NOTA: resumen_geografia fue removida del flujo por problemas
+# de calidad / consistencia en la dimensión geográfica.
 # ============================================================
 
 MAPA_VERDAD: Dict[str, str] = {
@@ -51,7 +53,6 @@ MAPA_VERDAD: Dict[str, str] = {
     "resumen_ventas_periodo": f"{PROJECT_ID}.{AI_DATASET}.resumen_ventas_periodo",
     "resumen_productos_ventas": f"{PROJECT_ID}.{AI_DATASET}.resumen_productos_ventas",
     "resumen_productos_retencion": f"{PROJECT_ID}.{AI_DATASET}.resumen_productos_retencion",
-    "resumen_geografia": f"{PROJECT_ID}.{AI_DATASET}.resumen_geografia",
     "afinidad_productos": f"{PROJECT_ID}.{AI_DATASET}.afinidad_productos",
     "auditoria_datos": f"{PROJECT_ID}.{AI_DATASET}.auditoria_datos",
 }
@@ -323,6 +324,140 @@ def construir_contexto_historial(
     return historial_chat
 
 
+# ============================================================
+# GEOGRAFIA: NORMALIZACION LOCAL + APOYO GEMINI
+# ============================================================
+
+def contiene_geografia(pregunta_usuario: str) -> bool:
+    q = pregunta_usuario.lower()
+    keywords = [
+        "comuna", "comunas", "region", "región", "provincia", "provincias",
+        "ciudad", "ciudades", "zona", "territorio", "rm", "metropolitana",
+        "santiago", "providencia", "las condes", "vitacura", "maipu", "maipú",
+        "ñuñoa", "nunoa", "la reina", "lo barnechea", "puente alto", "talca",
+        "maule", "biobio", "bio bio", "concepcion", "concepción"
+    ]
+    return any(k in q for k in keywords)
+
+
+def normalizar_terminos_geograficos_local(pregunta_usuario: str) -> Dict[str, List[str]]:
+    q = pregunta_usuario.lower()
+
+    alias_region = {
+        "rm": "METROPOLITANA DE SANTIAGO",
+        "region metropolitana": "METROPOLITANA DE SANTIAGO",
+        "región metropolitana": "METROPOLITANA DE SANTIAGO",
+        "metropolitana de santiago": "METROPOLITANA DE SANTIAGO",
+        "metropolitana": "METROPOLITANA DE SANTIAGO",
+        "maule": "MAULE",
+        "biobio": "BIOBIO",
+        "bio bio": "BIOBIO",
+        "ñuble": "NUBLE",
+        "nuble": "NUBLE",
+    }
+
+    alias_comuna = {
+        "santiago centro": "SANTIAGO",
+        "santiago": "SANTIAGO",
+        "provi": "PROVIDENCIA",
+        "providencia": "PROVIDENCIA",
+        "las condes": "LAS CONDES",
+        "vitacura": "VITACURA",
+        "nunoa": "NUNOA",
+        "ñuñoa": "NUNOA",
+        "maipu": "MAIPU",
+        "maipú": "MAIPU",
+        "la reina": "LA REINA",
+        "lo barnechea": "LO BARNECHEA",
+        "puente alto": "PUENTE ALTO",
+        "talca": "TALCA",
+        "concepcion": "CONCEPCION",
+        "concepción": "CONCEPCION",
+        "san miguel": "SAN MIGUEL",
+        "la florida": "LA FLORIDA",
+        "recoleta": "RECOLETA",
+        "macul": "MACUL",
+        "estacion central": "ESTACION CENTRAL",
+        "estación central": "ESTACION CENTRAL",
+    }
+
+    regiones = []
+    comunas = []
+
+    for k, v in alias_region.items():
+        if k in q:
+            regiones.append(v)
+
+    for k, v in alias_comuna.items():
+        if k in q:
+            comunas.append(v)
+
+    return {
+        "regiones": list(dict.fromkeys(regiones)),
+        "comunas": list(dict.fromkeys(comunas)),
+    }
+
+
+def normalizar_geografia_con_gemini(pregunta_usuario: str) -> str:
+    prompt = f"""
+Extrae y normaliza la intención geográfica del usuario para análisis SQL.
+
+Reglas:
+- Distingue entre comuna, provincia y región.
+- Usa nombres canónicos en mayúscula.
+- Si "Santiago" aparece solo, aclara si probablemente corresponde a comuna o a región metropolitana, pero sin inventar certeza total.
+- Si el usuario dice "Santiago y comunas de esa región", interpreta:
+  - SANTIAGO como comuna cuando aplique a una comuna.
+  - METROPOLITANA DE SANTIAGO como región cuando aplique a una región.
+- No devuelvas SQL.
+- No expliques de más.
+- Responde en texto estructurado breve.
+
+Pregunta:
+{pregunta_usuario}
+"""
+
+    try:
+        response = genai_client.models.generate_content(
+            model=MODEL_RESPONSE,
+            contents=prompt,
+        )
+        return obtener_texto_modelo(response).strip()
+    except Exception:
+        return ""
+
+
+def construir_contexto_geografico_normalizado(pregunta_usuario: str) -> str:
+    if not contiene_geografia(pregunta_usuario):
+        return ""
+
+    local = normalizar_terminos_geograficos_local(pregunta_usuario)
+
+    partes = []
+    if local["regiones"]:
+        partes.append("REGIONES_NORMALIZADAS_LOCAL:\n- " + "\n- ".join(local["regiones"]))
+    if local["comunas"]:
+        partes.append("COMUNAS_NORMALIZADAS_LOCAL:\n- " + "\n- ".join(local["comunas"]))
+
+    usar_gemini = False
+    if not local["regiones"] and not local["comunas"]:
+        usar_gemini = True
+
+    # También usamos Gemini si hay "Santiago" porque es un caso ambiguo.
+    if "santiago" in pregunta_usuario.lower():
+        usar_gemini = True
+
+    if usar_gemini:
+        contexto_gemini = normalizar_geografia_con_gemini(pregunta_usuario)
+        if contexto_gemini:
+            partes.append(f"INTERPRETACION_GEOGRAFICA_GEMINI:\n{contexto_gemini}")
+
+    if not partes:
+        return ""
+
+    return "\n\n".join(partes)
+
+
 def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
     q = pregunta_usuario.lower()
     prioridades = []
@@ -349,11 +484,12 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["fact_pedido_productos"],
         ]
 
-    if any(x in q for x in ["comuna", "geo", "geografía", "geografia", "ciudad", "zona", "territorio", "región", "region"]):
+    if any(x in q for x in ["comuna", "geo", "geografía", "geografia", "ciudad", "zona", "territorio", "región", "region", "provincia", "provincias"]):
         prioridades += [
-            MAPA_VERDAD["resumen_geografia"],
             MAPA_VERDAD["dim_clientes"],
             MAPA_VERDAD["fact_pedidos"],
+            MAPA_VERDAD["fact_pedido_productos"],
+            MAPA_VERDAD["perfil_clientes_360"],
         ]
 
     if any(x in q for x in ["calidad", "auditoría", "auditoria", "error", "cobertura"]):
@@ -371,7 +507,6 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["perfil_clientes_360"],
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["resumen_productos_retencion"],
-            MAPA_VERDAD["resumen_geografia"],
             MAPA_VERDAD["afinidad_productos"],
         ]
 
@@ -381,7 +516,6 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["perfil_clientes_360"],
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["resumen_productos_retencion"],
-            MAPA_VERDAD["resumen_geografia"],
             MAPA_VERDAD["auditoria_datos"],
         ]
 
@@ -513,6 +647,7 @@ def construir_prompt_sql(
     historial_contexto: str,
     tablas_prioritarias: List[str],
     esquemas_texto: str,
+    contexto_geografico: str = "",
     error_previo: str = "",
 ) -> str:
     tablas_texto = "\n".join([f"- {t}" for t in tablas_prioritarias])
@@ -548,6 +683,9 @@ Puedes usar únicamente estas tablas:
 ## ESQUEMAS REALES DISPONIBLES
 {esquemas_texto}
 
+## CONTEXTO GEOGRAFICO NORMALIZADO
+{contexto_geografico}
+
 ## MEMORIA OPERATIVA
 {historial_contexto}
 
@@ -574,12 +712,14 @@ Piensa como un director de estrategia, medios y growth:
 5. Si la pregunta es sobre recompra, retención, producto ancla, producto gancho o canasta, prioriza `resumen_productos_retencion` y `afinidad_productos`.
 6. Si la pregunta es sobre clientes, segmentos, LTV, recurrencia, reactivación, riesgo o churn, prioriza `perfil_clientes_360` y `dim_clientes`.
 7. Si la pregunta es sobre comportamiento de compra detallado, puedes usar `fact_pedidos` y `fact_pedido_productos`.
-8. Si la pregunta es sobre geografía comercial, comunas o regiones, prioriza `resumen_geografia`.
+8. Si la pregunta es sobre geografía comercial, comunas, provincias, ciudades o regiones, prioriza `dim_clientes`, `fact_pedidos` y `fact_pedido_productos`.
 9. Si la pregunta es sobre calidad de datos o cobertura, prioriza `auditoria_datos`.
 10. Si la pregunta es ambigua, elige la ruta más segura, más liviana y más ejecutiva.
 11. Si el usuario pide un informe, prioriza una consulta ejecutiva agregada antes que detalle transaccional.
 12. Si el usuario pide un informe por meses específicos, filtra explícitamente por esas fechas usando las columnas reales disponibles.
 13. Si no existe una columna mensual explícita, usa una fecha real disponible y agrupa o filtra con EXTRACT.
+14. La tabla de resumen geográfico agregada no debe usarse para construir consultas, aunque exista en el entorno.
+15. Si la pregunta combina geografía + tiempo + clientes nuevos + ranking de productos, prioriza tablas CORE con fechas reales y no tablas resumen agregadas.
 
 ## REGLAS TECNICAS OBLIGATORIAS
 1. Responde únicamente con SQL.
@@ -600,6 +740,13 @@ Piensa como un director de estrategia, medios y growth:
 16. Si el follow-up depende de un ranking, tabla o resultado anterior, continúa la lógica analítica sobre ese contexto en vez de reinterpretar la pregunta como una consulta completamente nueva.
 17. Incluso si la pregunta no contiene pronombres explícitos, si semánticamente depende de la respuesta previa, debes tratarla como continuación del análisis anterior.
 18. Si existe ambigüedad moderada entre una pregunta nueva y un follow-up, prioriza el contexto conversacional previo antes de asumir un cambio total de tema.
+19. Si existe CONTEXTO GEOGRAFICO NORMALIZADO, úsalo como fuente principal para decidir filtros geográficos.
+20. No reinterpretar libremente la geografía del usuario si ya fue normalizada antes.
+21. Distingue explícitamente entre comuna, ciudad, provincia y región usando los nombres reales de las tablas.
+22. No asumas que "Santiago" equivale automáticamente a "METROPOLITANA DE SANTIAGO"; usa el contexto geográfico normalizado.
+23. Si el usuario pide "Santiago y comunas de esa región", interpreta a SANTIAGO como comuna y a METROPOLITANA DE SANTIAGO como región cuando corresponda al contexto.
+24. Para análisis anuales por geografía, no uses únicamente tablas agregadas si no contienen una columna anual explícita.
+25. Si la ubicación viene con errores de escritura o alias, apóyate en el CONTEXTO GEOGRAFICO NORMALIZADO para usar la forma canónica más probable.
 
 ## FORMATO DE SALIDA
 - Entrega solo SQL puro.
@@ -816,6 +963,7 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
         )
 
     esquemas_texto = formatear_esquemas_para_prompt(esquemas)
+    contexto_geografico = construir_contexto_geografico_normalizado(pregunta_usuario)
 
     error_previo = ""
     ultimo_error = ""
@@ -827,6 +975,7 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
             historial_contexto=historial_contexto,
             tablas_prioritarias=tablas_disponibles,
             esquemas_texto=esquemas_texto,
+            contexto_geografico=contexto_geografico,
             error_previo=error_previo,
         )
 
