@@ -1,21 +1,88 @@
 import io
+import re
+import tempfile
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import plotly.express as px
+import plotly.io as pio
 import streamlit as st
 from google import genai
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Image,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 # ============================================================
-# CONFIGURACION BASE - "ELITE SETUP 2026"
+# CONFIGURACION BASE
 # ============================================================
-
-# 1. Identificadores de Modelos (Los más estables y potentes para hoy)
-MODEL_SQL = "gemini-3.1-pro"            # El cerebro para BigQuery
-MODEL_RESPONSE = "gemini-3.1-flash-lite" # La respuesta instantánea al usuario
-MODEL_MEDIA = "gemini-3.1-flash"         # Para contraste o análisis de archivos
 
 PROJECT_ID = st.secrets.get("PROJECT_ID", "data-marketing-360")
 LOCATION = st.secrets.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+BRAND_ID = st.secrets.get("BRAND_ID", "campo_noble")
 
+CORE_DATASET = f"{BRAND_ID}_core"
+AI_DATASET = f"{BRAND_ID}_ai"
+
+MAX_ROWS_RESULT = 300
+MAX_HISTORY_MESSAGES = 6
+MAX_SQL_RETRIES = 2
+MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
+
+# Configuración de modelos optimizada para 2026 (Alta disponibilidad)
+# Estos modelos son los que NO deberían tener problemas de cuota o estabilidad:
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3.1-pro")
+MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3.1-flash-lite")
+MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3.1-flash")
+
+# Fallbacks actualizados a la serie 3.x
+MODEL_FALLBACKS_SQL = [
+    "gemini-3.1-flash",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+]
+
+ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", True)
+
+# ============================================================
+# CLIENTES Y AUTENTICACIÓN (Cuenta de Administrador)
+# ============================================================
+
+def get_clients():
+    # Se asume que el JSON de la Service Account está en st.secrets["gcp_service_account"]
+    info = st.secrets["gcp_service_account"]
+    credentials = service_account.Credentials.from_service_account_info(info)
+    
+    # Cliente de BigQuery con credenciales de administrador
+    bq_client = bigquery.Client(
+        credentials=credentials,
+        project=PROJECT_ID,
+        location=LOCATION
+    )
+    
+    # Cliente de Google GenAI (Vertex AI habilitado)
+    genai_client = genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location=LOCATION,
+        credentials=credentials
+    )
+    
+    return bq_client, genai_client
+
+bq_client, genai_client = get_clients()
 # ============================================================
 # INICIALIZACIÓN CON CUENTA DE ADMINISTRADOR (Service Account)
 # ============================================================
