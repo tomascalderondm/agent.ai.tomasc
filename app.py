@@ -42,9 +42,16 @@ MAX_HISTORY_MESSAGES = 6
 MAX_SQL_RETRIES = 2
 MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
 
-MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-2.5-flash")
-MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-2.5-flash")
-MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-2.5-flash")
+# Gemini 3 Flash existe en Vertex AI; dejamos fallback por seguridad.
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3-flash")
+MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3-flash")
+MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3-flash")
+
+MODEL_FALLBACKS = [
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
 
 ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", True)
 
@@ -130,6 +137,25 @@ def resumir_dataframe_para_prompt(df: pd.DataFrame, max_rows: int = 60) -> str:
     return df.head(max_rows).to_string(index=False)
 
 
+def generar_contenido_con_fallback(prompt: str, preferred_model: str):
+    candidatos = [preferred_model] + [m for m in MODEL_FALLBACKS if m != preferred_model]
+    ultimo_error = None
+
+    for model_name in candidatos:
+        try:
+            response = genai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            if response is not None:
+                return response
+        except Exception as e:
+            ultimo_error = e
+            continue
+
+    raise ValueError(f"No pude generar contenido con ningún modelo Gemini configurado. Último error: {ultimo_error}")
+
+
 def es_pregunta_medios_o_inversion(pregunta_usuario: str) -> bool:
     q = pregunta_usuario.lower()
     keywords = [
@@ -207,6 +233,160 @@ def es_followup_de_respuesta_anterior(pregunta_usuario: str) -> bool:
     return False
 
 
+# ============================================================
+# NUEVAS FUNCIONES GEOGRÁFICAS CRÍTICAS
+# ============================================================
+
+def es_pregunta_geografica(pregunta_usuario: str) -> bool:
+    q = pregunta_usuario.lower()
+    keywords = [
+        "comuna", "comunas", "región", "region", "provincia", "provincias",
+        "ciudad", "ciudades", "geografía", "geografia", "territorio", "mapa"
+    ]
+    return any(k in q for k in keywords)
+
+
+def es_pregunta_geografica_de_clientes(pregunta_usuario: str) -> bool:
+    q = pregunta_usuario.lower()
+
+    hay_geo = es_pregunta_geografica(pregunta_usuario)
+    hay_cliente = any(k in q for k in [
+        "cliente", "clientes", "distribución", "distribucion", "porcentaje",
+        "participación", "participacion", "share", "concentración", "concentracion",
+        "penetración", "penetracion", "cuántos clientes", "cuantos clientes",
+        "clientes por comuna", "clientes por region", "clientes por provincia"
+    ])
+
+    hay_metricas_clientes = any(k in q for k in [
+        "clientes", "cliente único", "cliente unico", "clientes únicos", "clientes unicos"
+    ])
+
+    return hay_geo and (hay_cliente or hay_metricas_clientes)
+
+
+def construir_bloque_reglas_geograficas_criticas() -> str:
+    return f"""
+## REGLAS CRÍTICAS DE ANÁLISIS GEOGRÁFICO
+
+La asignación geográfica de un cliente debe obtenerse exclusivamente desde la tabla:
+- `{MAPA_VERDAD["dim_clientes"]}`
+
+utilizando la columna:
+- `cliente_id`
+
+### REGLA 1 — ORIGEN DE LA COMUNA
+La comuna de un cliente debe provenir únicamente de:
+- `dim_clientes.comuna_principal`
+
+Nunca utilizar la comuna proveniente de:
+- `fact_pedidos`
+- `fact_pedidos_limpios`
+- `geo_fuentes_raw`
+- `geo_fuentes_limpias`
+- `geo_inteligencia_base`
+
+Las tablas de pedidos pueden contener direcciones múltiples por cliente y NO deben usarse para asignar geografía del cliente.
+
+### REGLA 2 — CLIENTE ÚNICO POR COMUNA
+Cada cliente debe pertenecer a una sola comuna al momento de calcular distribución geográfica.
+
+Esto se logra cruzando:
+- `fact_pedidos.cliente_id`
+con
+- `dim_clientes.cliente_id`
+
+### REGLA 3 — CÁLCULO CORRECTO DE CLIENTES POR COMUNA
+El patrón correcto es:
+
+SELECT
+    dc.comuna_principal,
+    COUNT(DISTINCT fp.cliente_id) clientes
+FROM `{MAPA_VERDAD["fact_pedidos"]}` fp
+JOIN `{MAPA_VERDAD["dim_clientes"]}` dc
+ON fp.cliente_id = dc.cliente_id
+GROUP BY dc.comuna_principal
+
+### REGLA 4 — CÁLCULO DE PORCENTAJES
+El denominador debe ser el total de clientes únicos:
+- `COUNT(DISTINCT cliente_id)`
+
+Nunca sumar porcentajes si un cliente aparece en más de una comuna.
+
+### REGLA 5 — USO DE TABLAS
+- `dim_clientes` → geografía del cliente
+- `fact_pedidos` → ventas / actividad / fechas / recurrencia
+- `fact_pedidos_limpios` → análisis de productos
+
+### REGLA 6 — DETECCIÓN DE ERRORES
+Si los porcentajes por comuna superan el 100% total o varias comunas muestran porcentajes cercanos al 50% simultáneamente, debes asumir duplicidad geográfica y recalcular utilizando únicamente `dim_clientes`.
+
+### REGLA 7 — MODELO MENTAL
+La geografía pertenece al cliente.
+Las compras pertenecen al pedido.
+
+Nunca inferir geografía desde pedidos.
+"""
+
+
+def obtener_bloque_geografico_dinamico(pregunta_usuario: str) -> str:
+    if es_pregunta_geografica_de_clientes(pregunta_usuario):
+        return construir_bloque_reglas_geograficas_criticas()
+
+    if es_pregunta_geografica(pregunta_usuario):
+        return f"""
+## REGLA GEOGRÁFICA DE PRECAUCIÓN
+Si la pregunta busca distribución, porcentaje, concentración o conteo de clientes por geografía, debes usar obligatoriamente:
+- `{MAPA_VERDAD["dim_clientes"]}` como fuente de geografía del cliente
+- `{MAPA_VERDAD["fact_pedidos"]}` solo para actividad, ventas, fechas y recurrencia
+
+Nunca asignes comuna del cliente desde tablas de pedidos ni desde tablas raw geográficas.
+"""
+    return ""
+
+
+def validar_sql_geografica_critica(query: str, pregunta_usuario: str) -> Tuple[bool, str]:
+    if not es_pregunta_geografica_de_clientes(pregunta_usuario):
+        return True, ""
+
+    sql = limpiar_sql(query).lower()
+
+    forbidden_patterns = [
+        "fp.comuna",
+        "fp.comuna_principal",
+        "fact_pedidos.comuna",
+        "fact_pedidos_limpios.comuna",
+        "geo_fuentes_raw",
+        "geo_fuentes_limpias",
+        "geo_inteligencia_base",
+    ]
+    for pat in forbidden_patterns:
+        if pat in sql:
+            return False, (
+                "Para análisis geográfico de clientes no se puede inferir la geografía desde pedidos ni desde tablas geográficas raw/inteligencia. "
+                "La comuna debe salir de dim_clientes.comuna_principal."
+            )
+
+    usa_dim_clientes = f"`{MAPA_VERDAD['dim_clientes']}`".lower() in sql
+    usa_fact_pedidos = f"`{MAPA_VERDAD['fact_pedidos']}`".lower() in sql
+
+    if not usa_dim_clientes:
+        return False, "Falta usar dim_clientes como fuente exclusiva de geografía del cliente."
+
+    if not usa_fact_pedidos:
+        return False, "Falta usar fact_pedidos para calcular clientes activos/reales sobre actividad."
+
+    if "comuna_principal" not in sql:
+        return False, "La asignación geográfica debe usar dim_clientes.comuna_principal."
+
+    if "count(distinct" not in sql:
+        return False, "El cálculo geográfico de clientes debe usar COUNT(DISTINCT cliente_id)."
+
+    if "join" not in sql:
+        return False, "La consulta debe cruzar fact_pedidos.cliente_id con dim_clientes.cliente_id."
+
+    return True, ""
+
+
 def detectar_followup_semantico_con_modelo(
     pregunta_usuario: str,
     ultima_pregunta: str,
@@ -245,10 +425,7 @@ NUEVA_PREGUNTA:
 {pregunta_usuario}
 """
     try:
-        response = genai_client.models.generate_content(
-            model=MODEL_RESPONSE,
-            contents=prompt,
-        )
+        response = generar_contenido_con_fallback(prompt, MODEL_RESPONSE)
         texto = obtener_texto_modelo(response).strip().upper()
         return "FOLLOWUP" in texto
     except Exception:
@@ -333,6 +510,7 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["fact_pedidos"],
             MAPA_VERDAD["geo_inteligencia_base"],
             MAPA_VERDAD["resumen_geografia"],
+            MAPA_VERDAD["dim_clientes"],
         ]
 
     if any(x in q for x in ["cliente", "clientes", "ltv", "segmento", "recurrente", "nuevo", "riesgo", "inactividad", "churn", "reactivar"]):
@@ -340,8 +518,8 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["perfil_clientes_360"],
             MAPA_VERDAD["dim_clientes"],
             MAPA_VERDAD["fact_pedidos"],
-            MAPA_VERDAD["geo_inteligencia_base"],
             MAPA_VERDAD["resumen_geografia"],
+            MAPA_VERDAD["geo_filtros_expandibles"],
         ]
 
     if any(x in q for x in ["producto", "productos", "retención", "retencion", "recompra", "gancho", "afinidad", "bundle", "mix", "canasta"]):
@@ -350,15 +528,24 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["resumen_productos_ventas"],
             MAPA_VERDAD["afinidad_productos"],
             MAPA_VERDAD["fact_pedido_productos"],
-            MAPA_VERDAD["geo_inteligencia_base"],
+            MAPA_VERDAD["fact_pedidos_limpios"],
         ]
 
-    if any(x in q for x in ["comuna", "comunas", "ciudad", "ciudades", "provincia", "provincias", "región", "region", "geo", "geografia", "geografía"]):
+    if es_pregunta_geografica_de_clientes(pregunta_usuario):
         prioridades += [
+            MAPA_VERDAD["dim_clientes"],
+            MAPA_VERDAD["fact_pedidos"],
+            MAPA_VERDAD["geo_filtros_expandibles"],
+            MAPA_VERDAD["geo_catalogo_chile_normalizado"],
+        ]
+    elif any(x in q for x in ["comuna", "comunas", "ciudad", "ciudades", "provincia", "provincias", "región", "region", "geo", "geografia", "geografía"]):
+        prioridades += [
+            MAPA_VERDAD["dim_clientes"],
             MAPA_VERDAD["resumen_geografia"],
             MAPA_VERDAD["geo_inteligencia_base"],
             MAPA_VERDAD["geo_filtros_expandibles"],
             MAPA_VERDAD["geo_catalogo_chile_normalizado"],
+            MAPA_VERDAD["fact_pedidos"],
         ]
 
     if any(x in q for x in ["calidad", "auditoría", "auditoria", "error", "cobertura"]):
@@ -379,6 +566,7 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["resumen_productos_retencion"],
             MAPA_VERDAD["afinidad_productos"],
             MAPA_VERDAD["geo_inteligencia_base"],
+            MAPA_VERDAD["dim_clientes"],
         ]
 
     if es_pregunta_informe(pregunta_usuario):
@@ -390,6 +578,7 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["resumen_geografia"],
             MAPA_VERDAD["auditoria_datos"],
             MAPA_VERDAD["geo_inteligencia_base"],
+            MAPA_VERDAD["dim_clientes"],
         ]
 
     if not prioridades:
@@ -397,6 +586,8 @@ def obtener_tablas_prioritarias(pregunta_usuario: str) -> List[str]:
             MAPA_VERDAD["resumen_ventas_periodo"],
             MAPA_VERDAD["perfil_clientes_360"],
             MAPA_VERDAD["resumen_productos_ventas"],
+            MAPA_VERDAD["dim_clientes"],
+            MAPA_VERDAD["fact_pedidos"],
         ]
 
     return list(dict.fromkeys(prioridades))
@@ -497,6 +688,7 @@ def construir_prompt_sql(
     error_previo: str = "",
 ) -> str:
     tablas_texto = "\n".join([f"- {t}" for t in tablas_prioritarias])
+    bloque_geo = obtener_bloque_geografico_dinamico(pregunta_usuario)
 
     return f"""
 Eres NobleBotAI, motor de consulta SQL de BigQuery para inteligencia comercial, performance y marketing 360.
@@ -522,19 +714,22 @@ Debes escribir una única consulta SQL válida, segura y eficiente para responde
 ## ERROR PREVIO A CORREGIR
 {error_previo}
 
+{bloque_geo}
+
 ## REGLAS DE NEGOCIO
 - prioriza tablas AI cuando resuelvan la pregunta con claridad.
 - usa CORE solo si la pregunta requiere granularidad real.
-- si la pregunta es geográfica, resuélvela usando la capa geográfica canónica.
+- si la pregunta es geográfica y trata sobre clientes o distribución geográfica de clientes, la geografía del cliente debe salir exclusivamente de `dim_clientes.comuna_principal`.
+- si la pregunta es geográfica y trata sobre actividad, ventas o recurrencia, puedes usar `fact_pedidos` para medir la actividad y `dim_clientes` para fijar la geografía del cliente.
 - si el usuario pregunta por región o provincia, no filtres texto libremente en las tablas core.
-- si el usuario pregunta por región, expande a comunas usando `geo_filtros_expandibles`.
-- si el usuario pregunta por provincia, expande a comunas usando `geo_filtros_expandibles`.
-- si el usuario pregunta por comuna, puedes filtrar directamente por `comuna_canonica` o `comuna_principal` según la tabla AI.
-- para análisis geográficos transaccionales, prioriza `geo_inteligencia_base`.
-- para rankings y agregados rápidos por geografía, prioriza `resumen_geografia`.
-- nunca vuelvas a usar columnas geográficas crudas del core como lógica final de filtro si existe equivalente canónico en AI.
+- si el usuario pregunta por región, expande a comunas usando `geo_filtros_expandibles` y luego cruza esas comunas contra `dim_clientes.comuna_principal`.
+- si el usuario pregunta por provincia, expande a comunas usando `geo_filtros_expandibles` y luego cruza esas comunas contra `dim_clientes.comuna_principal`.
+- si el usuario pregunta por comuna en contexto de clientes, filtra usando `dim_clientes.comuna_principal`.
+- para rankings y agregados rápidos por ventas/geografía puedes usar tablas AI, pero no para asignar la geografía de un cliente.
+- nunca vuelvas a usar columnas geográficas crudas del core como lógica final de asignación de geografía del cliente si existe equivalente canónico en `dim_clientes`.
 - si el follow-up depende de una respuesta anterior, continúa sobre ese contexto.
 - si la pregunta parece ambigua, elige la ruta más segura y ejecutiva.
+- si la pregunta es distribución geográfica de clientes, cada cliente debe pertenecer a una sola comuna y el conteo debe ser COUNT(DISTINCT cliente_id).
 
 ## REGLAS TECNICAS OBLIGATORIAS
 1. Responde únicamente con SQL.
@@ -550,8 +745,10 @@ Debes escribir una única consulta SQL válida, segura y eficiente para responde
 11. Si del historial existe una referencia clara y útil, puedes reutilizarla.
 12. Si una tabla agregada resuelve la pregunta, no escales a una tabla más pesada.
 13. Si la pregunta del usuario hace referencia a una respuesta anterior como "ese ranking", "eso", "lo anterior" o similares, debes usar el CONTEXTO_ESTRUCTURADO_PREVIO para inferir correctamente a qué resultado se refiere.
-14. Si la pregunta es por región o provincia, la unidad analítica final sigue siendo la comuna, y luego agregas.
+14. Si la pregunta es por región o provincia y trata de clientes, la unidad analítica base sigue siendo la comuna del cliente en `dim_clientes`, y luego agregas.
 15. Evita scans innecesarios.
+16. Si la pregunta es distribución geográfica de clientes, no puedes usar `geo_inteligencia_base`, `geo_fuentes_raw`, `geo_fuentes_limpias`, `fact_pedidos.comuna` ni otras comunas de pedido como fuente geográfica principal.
+17. Si calculas porcentajes por comuna, el denominador debe ser el total de clientes únicos y los porcentajes no deben duplicar clientes en varias comunas.
 
 ## FORMATO DE SALIDA
 - Entrega solo SQL puro.
@@ -596,6 +793,8 @@ Transforma resultados tabulares en una respuesta ejecutiva, clara, precisa y acc
    - Qué significa
    - Riesgo u oportunidad
    - Próximo paso
+11. Si la pregunta es geográfica y trata sobre clientes, recuerda que la geografía válida del cliente proviene de `dim_clientes.comuna_principal`.
+12. Si detectas porcentajes sospechosos o que suman más de 100%, dilo explícitamente como riesgo metodológico.
 
 ## CONTEXTO DE CONVERSACION
 {historial_contexto}
@@ -654,10 +853,7 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
             error_previo=error_previo,
         )
 
-        respuesta_sql = genai_client.models.generate_content(
-            model=MODEL_SQL,
-            contents=prompt_sql,
-        )
+        respuesta_sql = generar_contenido_con_fallback(prompt_sql, MODEL_SQL)
 
         query_limpio = limpiar_sql(obtener_texto_modelo(respuesta_sql))
         ultimo_sql_generado = query_limpio
@@ -666,6 +862,12 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
         if not es_valida:
             ultimo_error = f"[Intento {intento + 1}] SQL inválido: {motivo}\n\nSQL generado:\n{query_limpio}"
             error_previo = f"La consulta previa fue inválida. Motivo: {motivo}"
+            continue
+
+        es_valida_geo, motivo_geo = validar_sql_geografica_critica(query_limpio, pregunta_usuario)
+        if not es_valida_geo:
+            ultimo_error = f"[Intento {intento + 1}] SQL geográfico inválido: {motivo_geo}\n\nSQL generado:\n{query_limpio}"
+            error_previo = f"La consulta previa incumplió reglas geográficas críticas. Motivo: {motivo_geo}"
             continue
 
         try:
@@ -702,10 +904,7 @@ def responder_como_noblebot(
         num_filas=len(df_datos),
     )
 
-    respuesta_final = genai_client.models.generate_content(
-        model=MODEL_RESPONSE,
-        contents=prompt_final,
-    )
+    respuesta_final = generar_contenido_con_fallback(prompt_final, MODEL_RESPONSE)
     texto = obtener_texto_modelo(respuesta_final).strip()
 
     if not texto:
@@ -729,7 +928,6 @@ def elegir_columnas_para_grafico(df: pd.DataFrame) -> Tuple[Optional[str], Optio
     numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
     all_cols = df.columns.tolist()
 
-    # Prioridad de Y
     preferencias_y = [
         "ventas_totales_clp", "venta_clp", "ventas", "total", "ingresos",
         "clientes_unicos", "clientes", "pedidos_totales", "pedidos",
@@ -746,7 +944,6 @@ def elegir_columnas_para_grafico(df: pd.DataFrame) -> Tuple[Optional[str], Optio
     if not y_col and numeric_cols:
         y_col = numeric_cols[0]
 
-    # Prioridad de X
     x_col = None
     preferencias_x = [
         "comuna", "provincia", "region", "anio", "año", "mes",
