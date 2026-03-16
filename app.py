@@ -26,7 +26,7 @@ from reportlab.platypus import (
 )
 
 # ============================================================
-# PAGE CONFIG (debe ir antes de otros elementos visuales de Streamlit)
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(page_title="NobleBotAI 🐷🐽", layout="wide")
@@ -47,27 +47,19 @@ MAX_HISTORY_MESSAGES = 6
 MAX_SQL_RETRIES = 2
 MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
 
-# Modelo principal en Gemini 3 Flash
-MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3-flash")
-MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3-flash")
-MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3-flash")
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-2.5-flash")
+MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-2.5-flash")
+MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-2.5-flash")
 
-# Fallbacks robustos
 MODEL_FALLBACKS_SQL = [
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
 ]
 
 MODEL_FALLBACKS_RESPONSE = [
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
 ]
 
 MODEL_FALLBACKS_MEDIA = [
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
 ]
 
@@ -75,6 +67,36 @@ ENABLE_EXTERNAL_CORROBORATION = st.secrets.get(
     "ENABLE_EXTERNAL_CORROBORATION",
     True,
 )
+
+# ============================================================
+# CLIENTES Y AUTENTICACION
+# ============================================================
+
+@st.cache_resource
+def get_clients():
+    service_account_info = dict(st.secrets["gcp_service_account"])
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+
+    bq_client = bigquery.Client(
+        credentials=credentials,
+        project=PROJECT_ID,
+        location=LOCATION,
+    )
+
+    genai_client = genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location=LOCATION,
+        credentials=credentials,
+    )
+
+    return bq_client, genai_client
+
+
+bq_client, genai_client = get_clients()
 
 # ============================================================
 # MAPA DE VERDAD OFICIAL
@@ -109,36 +131,6 @@ MAPA_VERDAD: Dict[str, str] = {
 }
 
 ALLOWED_TABLES = set(MAPA_VERDAD.values())
-
-# ============================================================
-# CLIENTES Y AUTENTICACION
-# ============================================================
-
-@st.cache_resource
-def get_clients():
-    service_account_info = dict(st.secrets["gcp_service_account"])
-    credentials = service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-
-    bq = bigquery.Client(
-        credentials=credentials,
-        project=PROJECT_ID,
-        location=LOCATION,
-    )
-
-    gx = genai.Client(
-        vertexai=True,
-        project=PROJECT_ID,
-        location=LOCATION,
-        credentials=credentials,
-    )
-
-    return bq, gx
-
-
-bq_client, genai_client = get_clients()
 
 # ============================================================
 # UTILIDADES GENERALES
@@ -262,7 +254,6 @@ def es_followup_de_respuesta_anterior(pregunta_usuario: str) -> bool:
             return True
 
     return False
-
 
 # ============================================================
 # NUEVAS FUNCIONES GEOGRAFICAS CRITICAS
@@ -529,7 +520,6 @@ def construir_contexto_historial(
 
     return historial_chat
 
-
 # ============================================================
 # TABLAS PRIORITARIAS
 # ============================================================
@@ -710,7 +700,6 @@ def diagnosticar_tablas() -> Dict[str, bool]:
             estado[alias] = False
     return estado
 
-
 # ============================================================
 # PROMPTS
 # ============================================================
@@ -847,7 +836,6 @@ Transforma resultados tabulares en una respuesta ejecutiva, clara, precisa y acc
 {datos_texto}
 """
 
-
 # ============================================================
 # MOTOR PRINCIPAL
 # ============================================================
@@ -958,7 +946,6 @@ def responder_como_noblebot(
         )
 
     return texto
-
 
 # ============================================================
 # GRAFICOS ON-DEMAND
@@ -1142,7 +1129,6 @@ def build_pdf_bytes() -> bytes:
     buffer.seek(0)
     return buffer.getvalue()
 
-
 # ============================================================
 # SESSION STATE
 # ============================================================
@@ -1170,7 +1156,6 @@ if "report_items" not in st.session_state:
 
 if "generated_charts" not in st.session_state:
     st.session_state.generated_charts = []
-
 
 # ============================================================
 # SIDEBAR
@@ -1206,7 +1191,6 @@ with st.sidebar:
         st.session_state.generated_charts = []
         st.rerun()
 
-
 # ============================================================
 # RENDER HISTORIAL
 # ============================================================
@@ -1214,7 +1198,6 @@ with st.sidebar:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-
 
 # ============================================================
 # FLUJO CHAT
@@ -1327,6 +1310,9 @@ if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas
             )
             st.markdown(respuesta_error)
             st.session_state.messages.append({"role": "assistant", "content": respuesta_error})
+
+            with st.expander("Detalle técnico"):
+                st.code(str(e))
 
             with st.expander("Detalle técnico"):
                 st.code(str(e))
