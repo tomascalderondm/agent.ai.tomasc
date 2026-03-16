@@ -23,10 +23,10 @@ BRAND_ID = st.secrets.get("BRAND_ID", "campo_noble")
 CORE_DATASET = f"{BRAND_ID}_core"
 AI_DATASET = f"{BRAND_ID}_ai"
 
-MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3.1-pro")
-MODEL_ROUTER = st.secrets.get("MODEL_ROUTER", "gemini-3.1-flash-lite")
-MODEL_CHAT = st.secrets.get("MODEL_CHAT", "gemini-3.1-flash-lite")
-MODEL_REPORT = st.secrets.get("MODEL_REPORT", "gemini-3.1-flash")
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3.1-pro-preview")
+MODEL_ROUTER = st.secrets.get("MODEL_ROUTER", "gemini-3.1-flash-lite-preview")
+MODEL_CHAT = st.secrets.get("MODEL_CHAT", "gemini-3.1-flash-lite-preview")
+MODEL_REPORT = st.secrets.get("MODEL_REPORT", "gemini-3.1-pro-preview")
 
 MAX_ROWS_RESULT = int(st.secrets.get("MAX_ROWS_RESULT", 200))
 MAX_HISTORY_MESSAGES = int(st.secrets.get("MAX_HISTORY_MESSAGES", 8))
