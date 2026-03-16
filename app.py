@@ -41,20 +41,14 @@ MAX_HISTORY_MESSAGES = 6
 MAX_SQL_RETRIES = 2
 MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
 
-# Configuración de modelos optimizada para 2026 (Alta disponibilidad)
-# Estos modelos son los que NO deberían tener problemas de cuota o estabilidad:
-MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3.1-pro")
-MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3.1-flash-lite")
-MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3.1-flash")
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-2.5-flash")
+MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-2.5-flash")
+MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-2.5-flash")
 
-# Fallbacks actualizados a la serie 3.x
-MODEL_FALLBACKS_SQL = [
-    "gemini-3.1-flash",
-    "gemini-3-flash",
-    "gemini-2.5-flash",
-]
-
-ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", True)
+ENABLE_EXTERNAL_CORROBORATION = st.secrets.get(
+    "ENABLE_EXTERNAL_CORROBORATION",
+    True,
+)
 
 # ============================================================
 # CLIENTES Y AUTENTICACIÓN (Cuenta de Administrador)
