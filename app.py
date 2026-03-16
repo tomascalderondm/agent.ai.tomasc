@@ -1,9 +1,11 @@
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 import streamlit as st
 from google import genai
 from google.cloud import bigquery
@@ -21,7 +23,6 @@ BRAND_ID = st.secrets.get("BRAND_ID", "campo_noble")
 CORE_DATASET = f"{BRAND_ID}_core"
 AI_DATASET = f"{BRAND_ID}_ai"
 
-# Gemini 3.1 en Vertex AI con cuenta de servicio
 MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3.1-pro")
 MODEL_ROUTER = st.secrets.get("MODEL_ROUTER", "gemini-3.1-flash-lite")
 MODEL_CHAT = st.secrets.get("MODEL_CHAT", "gemini-3.1-flash-lite")
@@ -32,7 +33,23 @@ MAX_HISTORY_MESSAGES = int(st.secrets.get("MAX_HISTORY_MESSAGES", 8))
 MAX_SQL_RETRIES = int(st.secrets.get("MAX_SQL_RETRIES", 2))
 MAX_BYTES_BILLED = int(st.secrets.get("MAX_BYTES_BILLED", 5 * 1024 * 1024 * 1024))
 MAX_SCHEMA_COLUMNS = int(st.secrets.get("MAX_SCHEMA_COLUMNS", 80))
-ENABLE_SQL_CACHE = bool(st.secrets.get("ENABLE_SQL_CACHE", True))
+
+
+def to_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
+
+
+ENABLE_SQL_CACHE = to_bool(st.secrets.get("ENABLE_SQL_CACHE", True), default=True)
+
+# Búsqueda externa opcional
+ENABLE_EXTERNAL_RESEARCH = to_bool(st.secrets.get("ENABLE_EXTERNAL_RESEARCH", False), default=False)
+SERPAPI_KEY = st.secrets.get("SERPAPI_KEY", "")
+NEWSAPI_KEY = st.secrets.get("NEWSAPI_KEY", "")
+EXTERNAL_RESEARCH_MAX_RESULTS = int(st.secrets.get("EXTERNAL_RESEARCH_MAX_RESULTS", 8))
 
 
 # ============================================================
@@ -61,6 +78,23 @@ MAPA_VERDAD: Dict[str, str] = {
     "resumen_geografia": f"{PROJECT_ID}.{AI_DATASET}.resumen_geografia",
 }
 ALLOWED_TABLES = set(MAPA_VERDAD.values())
+
+
+# ============================================================
+# CONTEXTO DE ENTIDADES CONOCIDAS
+# ============================================================
+KNOWN_ENTITIES = {
+    "campo noble": {
+        "type": "marca",
+        "description": "Campo Noble es una marca chilena de productos de cerdo vinculada a Coexca.",
+        "aliases": ["camponoble", "campo noble", "coexca campo noble"],
+    },
+    "coexca": {
+        "type": "empresa",
+        "description": "Coexca S.A. es una empresa chilena de carne de cerdo con integración vertical y presencia exportadora.",
+        "aliases": ["coexca", "coexca s.a.", "coexca sa"],
+    },
+}
 
 
 # ============================================================
@@ -97,6 +131,8 @@ if "last_answer" not in st.session_state:
     st.session_state.last_answer = ""
 if "last_route" not in st.session_state:
     st.session_state.last_route = ""
+if "last_intent" not in st.session_state:
+    st.session_state.last_intent = ""
 if "discussed_topics" not in st.session_state:
     st.session_state.discussed_topics = []
 if "pending_report" not in st.session_state:
@@ -109,6 +145,8 @@ if "report_goal" not in st.session_state:
     st.session_state.report_goal = ""
 if "sql_cache" not in st.session_state:
     st.session_state.sql_cache = {}
+if "last_research_context" not in st.session_state:
+    st.session_state.last_research_context = ""
 
 
 # ============================================================
@@ -134,7 +172,7 @@ SMALLTALK_PATTERNS = [
 
 GREETING_REPLY = (
     "Hola. Soy NobleBotAI 🐷🐽. Estoy listo para ayudarte con ventas, clientes, productos, geografía, "
-    "medios e informes. También puedo seguir el contexto de esta conversación sin consultar BigQuery si no hace falta."
+    "medios, informes e investigación externa si me la pides."
 )
 
 
@@ -172,7 +210,7 @@ def es_followup_heuristico(pregunta: str) -> bool:
     ]
     if any(x in q for x in patrones):
         return True
-    return len(q.split()) <= 8 and any(x in q.split() for x in ["eso", "ese", "esa", "y", "tambien", "también"])
+    return len(q.split()) <= 8 and any(x in q.split() for x in ["eso", "ese", "esa", "tambien", "también"])
 
 
 def compact_dataframe(df: Optional[pd.DataFrame], max_rows: int = 20) -> str:
@@ -202,25 +240,24 @@ def summarize_memory() -> str:
     blocks = []
     if st.session_state.get("last_route"):
         blocks.append(f"ULTIMA_RUTA: {st.session_state['last_route']}")
+    if st.session_state.get("last_intent"):
+        blocks.append(f"ULTIMO_INTENT: {st.session_state['last_intent']}")
     if st.session_state.get("last_sql"):
-        blocks.append(f"ULTIMO_SQL:
-{st.session_state['last_sql']}")
+        blocks.append(f"ULTIMO_SQL: {st.session_state['last_sql']}")
     if st.session_state.get("last_answer"):
-        blocks.append(f"ULTIMA_RESPUESTA:
-{st.session_state['last_answer']}")
+        blocks.append(f"ULTIMA_RESPUESTA: {st.session_state['last_answer']}")
     if last_df is not None and not last_df.empty:
-        blocks.append("ULTIMOS_DATOS:
-" + compact_dataframe(last_df, 15))
+        blocks.append("ULTIMOS_DATOS: " + compact_dataframe(last_df, 15))
     if st.session_state.get("report_mode"):
-        blocks.append(f"MODO_INFORME_ACTIVO: True")
+        blocks.append("MODO_INFORME_ACTIVO: True")
     if st.session_state.get("report_goal"):
         blocks.append(f"OBJETIVO_INFORME: {st.session_state['report_goal']}")
     if st.session_state.get("report_items"):
         blocks.append(f"PUNTOS_EN_INFORME: {len(st.session_state['report_items'])}")
+    if st.session_state.get("last_research_context"):
+        blocks.append("ULTIMO_CONTEXTO_EXTERN0: disponible")
     blocks.append(f"TEMAS_CONVERSADOS: {recent_topics_text()}")
-    return "
-
-".join(blocks)
+    return "  ".join(blocks)
 
 
 def build_chat_history(max_messages: int = MAX_HISTORY_MESSAGES) -> str:
@@ -230,35 +267,73 @@ def build_chat_history(max_messages: int = MAX_HISTORY_MESSAGES) -> str:
     return "\n".join([f"{m['role']}: {m['content']}" for m in recent])
 
 
+def known_entities_text() -> str:
+    bloques = []
+    for nombre, info in KNOWN_ENTITIES.items():
+        bloques.append(f"- {nombre}: {info.get('description', '')}")
+    return "\n".join(bloques)
+
+
 def report_mode_requested(q: str) -> bool:
+    q2 = lower_clean(q)
+
     triggers = [
         "al final quiero un informe",
         "quiero crear un informe al final",
         "vamos armando un informe",
         "quiero ir armando un informe",
-        "guarda esto para el informe",
         "ten en cuenta esto para el informe",
         "esto va al informe",
+        "desde ahora arma un informe",
+        "quiero construir un informe durante la conversación",
+        "anda guardando para el informe",
     ]
-    q2 = lower_clean(q)
-    return any(t in q2 for t in triggers)
+
+    if any(t in q2 for t in triggers):
+        return True
+
+    return bool(
+        re.search(r"\b(informe|reporte)\b.*\b(final|después|despues|al final)\b", q2)
+        or re.search(r"\b(armando|construyendo|guardando)\b.*\b(informe|reporte)\b", q2)
+    )
 
 
 def add_to_report_requested(q: str) -> bool:
-    triggers = [
+    q2 = lower_clean(q)
+
+    triggers_exactos = [
         "agrega esto al informe",
         "sumalo al informe",
         "súmalo al informe",
         "incluye esto en el informe",
-        "esto agregalo al informe",
-        "esto agrégalo al informe",
         "guarda esto en el informe",
+        "mete esto en el informe",
+        "pon esto en el informe",
+        "incorpora esto al informe",
+        "anota esto para el informe",
     ]
-    q2 = lower_clean(q)
-    return any(t in q2 for t in triggers)
+
+    if any(t in q2 for t in triggers_exactos):
+        return True
+
+    patrones_flexibles = [
+        r"\bagrega\b.*\binforme\b",
+        r"\bincluye\b.*\binforme\b",
+        r"\bguarda\b.*\binforme\b",
+        r"\bincorpora\b.*\binforme\b",
+        r"\bmete\b.*\binforme\b",
+        r"\bpon\b.*\binforme\b",
+        r"\banota\b.*\binforme\b",
+        r"\bsuma\b.*\binforme\b",
+        r"\besto\b.*\binforme\b",
+    ]
+
+    return any(re.search(p, q2) for p in patrones_flexibles)
 
 
 def final_report_requested(q: str) -> bool:
+    q2 = lower_clean(q)
+
     triggers = [
         "dame el informe",
         "entregame el informe",
@@ -268,13 +343,51 @@ def final_report_requested(q: str) -> bool:
         "crea el informe final",
         "ahora si dame el informe",
         "ya dame el informe",
+        "muéstrame el informe final",
+        "quiero ver el informe final",
+        "redacta el informe final",
+        "arma el informe final",
     ]
+
+    if any(t in q2 for t in triggers):
+        return True
+
+    return bool(
+        re.search(r"\b(informe final|reporte final)\b", q2)
+        or re.search(r"\b(dame|haz|crea|genera|arma|entrega|muestra|redacta)\b.*\b(informe|reporte)\b", q2)
+    )
+
+
+def research_mode_requested(q: str) -> bool:
     q2 = lower_clean(q)
-    return any(t in q2 for t in triggers)
+    return any(x in q2 for x in [
+        "investiga sobre",
+        "busca en google",
+        "busca noticias",
+        "noticias relevantes",
+        "último mes",
+        "ultimo mes",
+        "qué está pasando con",
+        "que está pasando con",
+        "que esta pasando con",
+        "quien es",
+        "quién es",
+        "empresa",
+        "competencia",
+        "benchmark",
+        "como lo hace",
+        "como lo haría",
+        "como lo haria",
+        "estudio de mercado",
+        "estudio de comportamiento de mercado",
+        "consultora",
+        "al estilo de",
+    ])
 
 
 def save_current_point_to_report(question: str, answer: str, sql: str = "", df: Optional[pd.DataFrame] = None, intent: str = ""):
     item = {
+        "timestamp": datetime.utcnow().isoformat(),
         "question": question,
         "answer": answer,
         "sql": sql,
@@ -282,7 +395,7 @@ def save_current_point_to_report(question: str, answer: str, sql: str = "", df: 
         "data_preview": compact_dataframe(df, 25) if df is not None else "Sin tabla asociada.",
     }
     st.session_state.report_items.append(item)
-    st.session_state.report_items = st.session_state.report_items[-20:]
+    st.session_state.report_items = st.session_state.report_items[-30:]
 
 
 def llm_call(
@@ -295,7 +408,7 @@ def llm_call(
     config = types.GenerateContentConfig(
         temperature=0,
         top_p=0.95,
-        max_output_tokens=2048,
+        max_output_tokens=4096,
     )
     if low_latency and not higher_reasoning:
         config.thinking_config = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
@@ -330,6 +443,18 @@ def classify_route(pregunta: str) -> RouteDecision:
             reason="smalltalk heurístico",
         )
 
+    if research_mode_requested(q):
+        return RouteDecision(
+            route="research",
+            intent="investigacion",
+            response_mode="strategic",
+            needs_bq=False,
+            followup=es_followup_heuristico(q),
+            asks_report_scope=False,
+            topic="investigación externa",
+            reason="heurística investigación web/noticias/benchmark",
+        )
+
     if any(x in q for x in ["hazme un informe", "haz un informe", "quiero un informe", "reporte", "informe ejecutivo"]):
         topics = st.session_state.get("discussed_topics", [])
         if len(topics) >= 2 and not any(x in q for x in ["ventas", "clientes", "productos", "geograf", "medios", "retencion", "retención"]):
@@ -344,7 +469,6 @@ def classify_route(pregunta: str) -> RouteDecision:
                 reason="hay varios temas previos y el alcance del informe no está definido",
             )
 
-    # Heurística rápida primero
     if any(x in q for x in ["comuna", "comunas", "region", "región", "provincia", "provincias", "talca", "maule", "geografia", "geografía"]):
         return RouteDecision("analytics", "geografia", "data", True, es_followup_heuristico(q), False, "geografía", "heurística geografía")
     if any(x in q for x in ["venta", "ventas", "ticket", "ingresos", "facturacion", "facturación", "mes", "año", "anio", "periodo", "período"]):
@@ -356,13 +480,11 @@ def classify_route(pregunta: str) -> RouteDecision:
     if any(x in q for x in ["meta ads", "google ads", "roas", "cac", "cpa", "paid media", "presupuesto", "inversion", "inversión", "campaña", "campana"]):
         return RouteDecision("analytics", "medios", "strategic", True, es_followup_heuristico(q), False, "medios", "heurística medios")
 
-    # Fallback barato con LLM router
     router_prompt = f"""
-Clasifica la consulta del usuario.
-Devuelve SOLO JSON válido con esta forma exacta:
+Clasifica la consulta del usuario. Devuelve SOLO JSON válido con esta forma exacta:
 {{
-  "route": "smalltalk|analytics|clarify_report_scope|chat",
-  "intent": "ventas|clientes|productos|geografia|medios|auditoria|informe|conversacion|otro",
+  "route": "smalltalk|analytics|clarify_report_scope|chat|research",
+  "intent": "ventas|clientes|productos|geografia|medios|auditoria|informe|conversacion|investigacion|benchmark|otro",
   "response_mode": "short|data|strategic|clarify",
   "needs_bq": true,
   "followup": false,
@@ -373,22 +495,21 @@ Devuelve SOLO JSON válido con esta forma exacta:
 
 Reglas:
 - route=smalltalk si el usuario solo saluda o conversa.
-- route=chat si puede responderse sin BigQuery.
+- route=chat si puede responderse sin BigQuery ni búsqueda externa.
 - route=analytics si necesita datos reales del warehouse.
+- route=research si pide investigar empresas, noticias, benchmark, estilo de consultora o búsqueda web.
 - route=clarify_report_scope si pide un informe pero no queda claro de cuál tema conversado.
-- needs_bq=false para saludos, agradecimientos, aclaraciones simples o coordinación.
+- needs_bq=false para saludos, agradecimientos, aclaraciones simples, benchmark, investigación externa o coordinación.
 - response_mode=data para respuestas directas con datos duros.
-- response_mode=strategic solo cuando el usuario pida lectura estratégica, inversión, recomendación o informe.
+- response_mode=strategic cuando el usuario pida lectura estratégica, investigación, benchmarking, inversión, recomendación o informe.
 - followup=true si depende del contexto anterior.
 
-TEMAS_CONVERSADOS:
-{recent_topics_text()}
+TEMAS_CONVERSADOS: {recent_topics_text()}
+ULTIMA_MEMORIA: {summarize_memory()}
+ENTIDADES_CONOCIDAS:
+{known_entities_text()}
 
-ULTIMA_MEMORIA:
-{summarize_memory()}
-
-PREGUNTA:
-{pregunta}
+PREGUNTA: {pregunta}
 """
     raw = llm_call(MODEL_ROUTER, router_prompt, low_latency=True)
     try:
@@ -401,6 +522,7 @@ PREGUNTA:
 # ============================================================
 # BIGQUERY / ESQUEMAS
 # ============================================================
+@st.cache_data(ttl=300)
 def diagnosticar_tablas() -> Dict[str, bool]:
     status = {}
     for alias, table_fq in MAPA_VERDAD.items():
@@ -572,6 +694,9 @@ MEMORIA_RECIENTE:
 CONTEXTO_ESTRUCTURADO:
 {summarize_memory()}
 
+ENTIDADES_CONOCIDAS:
+{known_entities_text()}
+
 PREGUNTA:
 {pregunta}
 
@@ -607,10 +732,14 @@ REGLAS TÉCNICAS:
 
 
 def generate_sql_with_retries(pregunta: str, route: RouteDecision) -> Tuple[str, pd.DataFrame]:
-    cache_key = f"{route.intent}::{pregunta.strip().lower()}::{st.session_state.get('last_sql','')}"
+    cache_key = f"{route.intent}::{pregunta.strip().lower()}"
+
     if ENABLE_SQL_CACHE and cache_key in st.session_state.sql_cache:
         sql_cached = st.session_state.sql_cache[cache_key]
-        return sql_cached, ejecutar_query(sql_cached)
+        try:
+            return sql_cached, ejecutar_query(sql_cached)
+        except Exception:
+            st.session_state.sql_cache.pop(cache_key, None)
 
     tablas = filtrar_tablas_existentes(obtener_tablas_prioritarias(pregunta, route.intent))
     if not tablas:
@@ -651,6 +780,219 @@ def generate_sql_with_retries(pregunta: str, route: RouteDecision) -> Tuple[str,
 
 
 # ============================================================
+# INVESTIGACIÓN EXTERNA
+# ============================================================
+def resolve_known_entity_context(query: str) -> str:
+    q = lower_clean(query)
+    matches = []
+    for _, info in KNOWN_ENTITIES.items():
+        aliases = info.get("aliases", [])
+        if any(alias in q for alias in aliases):
+            matches.append(info.get("description", ""))
+    return " | ".join(matches) if matches else ""
+
+
+def external_search_serpapi(query: str, num_results: int = EXTERNAL_RESEARCH_MAX_RESULTS) -> List[Dict]:
+    if not SERPAPI_KEY:
+        return []
+
+    try:
+        resp = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "engine": "google",
+                "q": query,
+                "hl": "es",
+                "gl": "cl",
+                "num": num_results,
+                "api_key": SERPAPI_KEY,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for item in data.get("organic_results", [])[:num_results]:
+            results.append({
+                "title": item.get("title", ""),
+                "link": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+                "source": item.get("source", "Google"),
+                "date": item.get("date", ""),
+            })
+        return results
+    except Exception:
+        return []
+
+
+def external_news_newsapi(query: str, days: int = 30, page_size: int = EXTERNAL_RESEARCH_MAX_RESULTS) -> List[Dict]:
+    if not NEWSAPI_KEY:
+        return []
+
+    try:
+        resp = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": query,
+                "language": "es",
+                "sortBy": "publishedAt",
+                "pageSize": page_size,
+                "apiKey": NEWSAPI_KEY,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for item in data.get("articles", [])[:page_size]:
+            results.append({
+                "title": item.get("title", ""),
+                "link": item.get("url", ""),
+                "snippet": item.get("description", ""),
+                "source": item.get("source", {}).get("name", "NewsAPI"),
+                "date": item.get("publishedAt", ""),
+            })
+        return results
+    except Exception:
+        return []
+
+
+def build_external_queries(prompt: str) -> Tuple[List[str], List[str]]:
+    q = clean_text(prompt)
+    q_lower = lower_clean(prompt)
+
+    entity_context = resolve_known_entity_context(prompt)
+    news_queries = []
+    web_queries = []
+
+    if entity_context:
+        web_queries.append(q)
+
+    if "último mes" in q_lower or "ultimo mes" in q_lower or "noticias" in q_lower:
+        news_queries.append(q)
+
+    if "campo noble" in q_lower and ("noticias" in q_lower or "último mes" in q_lower or "ultimo mes" in q_lower):
+        news_queries.append("Campo Noble Coexca noticias último mes")
+        web_queries.append("Campo Noble Coexca empresa marca cerdo Chile")
+
+    if "como lo hace" in q_lower or "al estilo de" in q_lower or "consultora" in q_lower:
+        web_queries.append(q)
+        web_queries.append(q + " metodología informe")
+        web_queries.append(q + " estudio comportamiento mercado")
+
+    if not news_queries and not web_queries:
+        web_queries.append(q)
+
+    return news_queries[:4], web_queries[:4]
+
+
+def format_external_results(news_results: List[Dict], web_results: List[Dict], entity_context: str) -> str:
+    bloques = []
+
+    if entity_context:
+        bloques.append(f"CONTEXTO_ENTIDAD_CONOCIDA: {entity_context}")
+
+    if news_results:
+        bloques.append("NOTICIAS_RELEVANTES:")
+        for i, item in enumerate(news_results, start=1):
+            bloques.append(
+                f"[NEWS {i}] TITULO: {item.get('title','')} | FUENTE: {item.get('source','')} | FECHA: {item.get('date','')} | LINK: {item.get('link','')} | RESUMEN: {item.get('snippet','')}"
+            )
+
+    if web_results:
+        bloques.append("RESULTADOS_WEB:")
+        for i, item in enumerate(web_results, start=1):
+            bloques.append(
+                f"[WEB {i}] TITULO: {item.get('title','')} | FUENTE: {item.get('source','')} | FECHA: {item.get('date','')} | LINK: {item.get('link','')} | RESUMEN: {item.get('snippet','')}"
+            )
+
+    if not bloques:
+        bloques.append("SIN_RESULTADOS_EXTERNOS_CONFIGURADOS")
+
+    return "\n".join(bloques)
+
+
+def run_external_research(prompt: str) -> str:
+    entity_context = resolve_known_entity_context(prompt)
+
+    if not ENABLE_EXTERNAL_RESEARCH:
+        return (
+            "INVESTIGACION_EXTERNA_NO_CONFIGURADA\n"
+            f"CONTEXTO_CONOCIDO: {entity_context if entity_context else 'Sin contexto conocido adicional.'}\n"
+            "Para activar investigación externa real, configura ENABLE_EXTERNAL_RESEARCH y una fuente como SERPAPI_KEY o NEWSAPI_KEY."
+        )
+
+    news_queries, web_queries = build_external_queries(prompt)
+
+    all_news_results: List[Dict] = []
+    all_web_results: List[Dict] = []
+
+    for q in news_queries:
+        all_news_results.extend(external_news_newsapi(q))
+
+    for q in web_queries:
+        all_web_results.extend(external_search_serpapi(q))
+
+    unique_news = []
+    seen_news = set()
+    for item in all_news_results:
+        key = (item.get("title", ""), item.get("link", ""))
+        if key not in seen_news:
+            seen_news.add(key)
+            unique_news.append(item)
+
+    unique_web = []
+    seen_web = set()
+    for item in all_web_results:
+        key = (item.get("title", ""), item.get("link", ""))
+        if key not in seen_web:
+            seen_web.add(key)
+            unique_web.append(item)
+
+    context = format_external_results(
+        unique_news[:EXTERNAL_RESEARCH_MAX_RESULTS],
+        unique_web[:EXTERNAL_RESEARCH_MAX_RESULTS],
+        entity_context,
+    )
+    st.session_state.last_research_context = context
+    return context
+
+
+def build_research_prompt(pregunta: str, external_context: str) -> str:
+    return f"""
+Eres NobleBotAI en modo investigación externa.
+
+PREGUNTA:
+{pregunta}
+
+CONTEXTO EXTERNO:
+{external_context}
+
+MEMORIA:
+{summarize_memory()}
+
+ENTIDADES_CONOCIDAS:
+{known_entities_text()}
+
+REGLAS:
+- Usa primero la evidencia entregada en el contexto externo.
+- Si el contexto externo no trae resultados reales, dilo explícitamente.
+- Si el usuario pidió noticias del último mes, prioriza recencia.
+- Si el usuario pidió empresa, resume quién es, qué hace, posicionamiento, señales recientes y contexto competitivo si existe.
+- Si el usuario pidió benchmark o "hazme un informe como lo hace tal empresa", identifica el estilo o metodología observable y adapta la estructura sin copiar textos.
+- Si el usuario pidió Campo Noble, entiende que es una marca ligada a Coexca.
+- No inventes.
+- Estructura la respuesta con:
+  1. Resumen
+  2. Hallazgos clave
+  3. Noticias o señales recientes
+  4. Lectura estratégica
+  5. Riesgos y oportunidades
+  6. Próximos pasos sugeridos
+"""
+
+
+# ============================================================
 # RESPONSE LAYER
 # ============================================================
 def suggested_next_steps(route: RouteDecision, pregunta: str, has_data: bool) -> List[str]:
@@ -683,6 +1025,11 @@ def suggested_next_steps(route: RouteDecision, pregunta: str, has_data: bool) ->
         return [
             "También puedo convertir esto en una propuesta de inversión en marketing.",
             "También puedo hacer una lectura ejecutiva para performance, CRM o retención.",
+        ]
+    if route.intent == "investigacion":
+        return [
+            "También puedo convertir esta investigación en un informe ejecutivo.",
+            "También puedo cruzar esto con tus datos internos si me pides una lectura combinada.",
         ]
     return [
         "También puedo profundizar en el mismo tema con otra dimensión.",
@@ -747,75 +1094,155 @@ def render_answer(pregunta: str, route: RouteDecision, sql: str, df: pd.DataFram
                 "Eso normalmente significa que el filtro quedó demasiado estrecho o faltó precisar mejor la consulta."
             )
         sugg = suggested_next_steps(route, pregunta, has_data=False)
-        return base + "
-
-" + "
-".join([f"- {s}" for s in sugg])
+        return base + "  " + " ".join([f"- {s}" for s in sugg])
 
     raw = llm_call(MODEL_CHAT, build_answer_prompt(pregunta, route, sql, df), low_latency=True)
     raw = raw.strip() or "Consulté las tablas oficiales y obtuve el resultado, pero la redacción final salió vacía."
     if st.session_state.get("report_mode"):
-        raw += "
-
-Puedo guardar este hallazgo para el informe final si me dices: agrega esto al informe."
+        raw += "  Este hallazgo quedó disponible para el informe final."
     return raw
 
 
-def build_report_prompt(user_request: str, scope: str) -> str:
-    items = st.session_state.get("report_items", [])
-    compiled_points = []
+# ============================================================
+# CONSOLIDACIÓN DE INFORME
+# ============================================================
+def build_report_consolidation_prompt(items: List[Dict], user_request: str, scope: str) -> str:
+    bloques = []
     for i, item in enumerate(items, start=1):
-        compiled_points.append(
-            f"PUNTO {i}
-"
-            f"PREGUNTA: {item.get('question', '')}
-"
-            f"INTENT: {item.get('intent', '')}
-"
-            f"RESPUESTA: {item.get('answer', '')}
-"
-            f"SQL: {item.get('sql', '')}
-"
-            f"DATOS: {item.get('data_preview', '')}"
+        bloques.append(
+            f"""
+PUNTO {i}
+TIMESTAMP: {item.get('timestamp', '')}
+INTENT: {item.get('intent', '')}
+QUESTION: {item.get('question', '')}
+ANSWER: {item.get('answer', '')}
+SQL: {item.get('sql', '')}
+DATA_PREVIEW: {item.get('data_preview', '')}
+""".strip()
         )
 
     return f"""
-Eres NobleBotAI.
-Genera un informe final EXTENSO, profundo y bien conectado para una agencia / marca ecommerce.
+Eres NobleBotAI. Debes consolidar puntos analíticos antes de redactar un informe final.
+
+PEDIDO_USUARIO: {user_request}
+ALCANCE: {scope}
+
+PUNTOS_ORIGINALES:
+{'  '.join(bloques) if bloques else 'No hay puntos.'}
+
+TAREA:
+1. Reordena los puntos cronológicamente usando TIMESTAMP.
+2. Detecta duplicados exactos o semánticos.
+3. Fusiona hallazgos repetidos o muy similares en un solo hallazgo consolidado.
+4. Prioriza los hallazgos más fuertes según:
+   - evidencia numérica,
+   - impacto comercial,
+   - recurrencia,
+   - claridad estratégica.
+5. Separa:
+   - hallazgos principales,
+   - hallazgos secundarios,
+   - conclusiones,
+   - riesgos,
+   - oportunidades.
+6. No inventes datos.
+7. Si dos puntos se contradicen, indícalo.
+8. Devuelve SOLO JSON válido con esta estructura:
+
+{{
+  "ordered_points": [
+    {{
+      "timestamp": "iso",
+      "question": "texto",
+      "intent": "texto",
+      "summary": "texto corto"
+    }}
+  ],
+  "merged_findings": [
+    {{
+      "title": "texto corto",
+      "priority": "alta|media|baja",
+      "strength_score": 1,
+      "evidence": "texto",
+      "merged_from": [1,2],
+      "business_impact": "texto",
+      "strategic_read": "texto"
+    }}
+  ],
+  "conclusions": ["texto", "texto"],
+  "risks": ["texto", "texto"],
+  "opportunities": ["texto", "texto"]
+}}
+"""
+
+
+def consolidate_report_items(user_request: str, scope: str) -> Dict:
+    items = st.session_state.get("report_items", [])
+    if not items:
+        return {}
+
+    items_sorted = sorted(items, key=lambda x: x.get("timestamp", ""))
+
+    raw = llm_call(
+        MODEL_REPORT,
+        build_report_consolidation_prompt(items_sorted, user_request, scope),
+        low_latency=False,
+        higher_reasoning=True,
+    )
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {
+            "ordered_points": [],
+            "merged_findings": [],
+            "conclusions": [],
+            "risks": [],
+            "opportunities": [],
+        }
+
+
+def build_report_prompt(user_request: str, scope: str) -> str:
+    consolidated = consolidate_report_items(user_request, scope)
+
+    return f"""
+Eres NobleBotAI. Genera un informe final EXTENSO, sólido y ejecutivo.
 
 ALCANCE DEL INFORME: {scope}
 PEDIDO ORIGINAL: {user_request}
 OBJETIVO_GENERAL: {st.session_state.get('report_goal', '')}
 
-MEMORIA DEL CHAT:
-{summarize_memory()}
+MEMORIA DEL CHAT: {summarize_memory()}
 
-PUNTOS ACUMULADOS PARA EL INFORME:
-{'
+ENTIDADES_CONOCIDAS:
+{known_entities_text()}
 
-'.join(compiled_points) if compiled_points else 'No hay puntos acumulados.'}
+CONSOLIDACION_PREVIA:
+{json.dumps(consolidated, ensure_ascii=False, indent=2)}
 
 REGLAS:
-- Usa solo lo conversado y lo consultado en esta sesión.
-- Consolida todos los puntos guardados en un solo documento coherente.
-- No inventes datos faltantes.
-- Cruza hallazgos entre secciones, no repitas como bloques aislados.
-- Debe ser bastante más extenso que una respuesta normal.
-- Extrae conclusiones, patrones, comparaciones y tensiones de negocio.
-- Si hay años o períodos, compáralos con claridad.
-- Si hay geografía, interpreta territorios, concentración y cambios.
-- Si hay clientes/productos/ventas, conecta impacto comercial.
-- Adáptalo a marketing, medios, ecommerce, CRM y agencia si aplica.
-- Debe sentirse sólido, no genérico.
+- Usa primero la evidencia interna de esta sesión.
+- Si el usuario pidió explícitamente investigación externa, integra también señales externas verificadas si existen.
+- Si el usuario pidió benchmark de consultora o empresa, adapta el enfoque, el tono y la estructura al estilo observado, sin copiar textos.
+- Usa la consolidación previa como base principal.
+- Respeta el orden cronológico de evolución del análisis.
+- No repitas hallazgos duplicados.
+- Fusiona hallazgos repetidos.
+- Prioriza hallazgos de mayor fuerza e impacto.
+- Debes inferir conclusiones, riesgos y oportunidades SOLO cuando haya base suficiente en los datos.
+- Si la evidencia es insuficiente, dilo.
+- Cruza ventas, clientes, productos, geografía, medios y negocio cuando corresponda.
+- No hagas un texto plano interminable: estructura, jerarquiza y sintetiza.
+- Debe sentirse como un informe serio de análisis de mercado/comercial, no como una respuesta casual.
 
 ESTRUCTURA OBLIGATORIA:
 1. Resumen ejecutivo
-2. Contexto y alcance del análisis
-3. Hallazgos clave consolidados
-4. Análisis detallado por tema
-5. Comparaciones relevantes y qué cambió
-6. Conclusiones estratégicas
-7. Riesgos y oportunidades
+2. Evolución cronológica del análisis
+3. Hallazgos clave priorizados
+4. Hallazgos consolidados por tema
+5. Conclusiones basadas en evidencia
+6. Riesgos
+7. Oportunidades
 8. Recomendaciones priorizadas
 9. Próximos análisis sugeridos
 """
@@ -828,10 +1255,12 @@ def handle_report_request(prompt: str) -> str:
     if report_mode_requested(prompt):
         st.session_state.report_mode = True
         st.session_state.report_goal = prompt
+        st.session_state.pending_report = False
         return (
-            "Perfecto. Desde ahora iré armando el informe en segundo plano durante esta conversación. "
-            "Cuando una respuesta quieras guardarla, puedes decirme 'agrega esto al informe'. "
-            "Y cuando quieras el documento final, pídeme 'dame el informe final'."
+            "Perfecto. Activé el modo informe. "
+            "Desde ahora iré guardando automáticamente los hallazgos analíticos de esta conversación para el informe final. "
+            "Si quieres, igual puedes reforzarlo con frases como 'agrega esto', 'incluye esto en el informe' o 'guárdalo para el reporte'. "
+            "Cuando quieras el documento final, pídeme el informe final."
         )
 
     if add_to_report_requested(prompt):
@@ -841,38 +1270,44 @@ def handle_report_request(prompt: str) -> str:
                 answer=st.session_state.get("last_answer", ""),
                 sql=st.session_state.get("last_sql", ""),
                 df=st.session_state.get("last_df", None),
-                intent=st.session_state.get("last_route", ""),
+                intent=st.session_state.get("last_intent", ""),
             )
+            st.session_state.pending_report = False
             return f"Listo. Ya agregué ese punto al informe. Puntos acumulados: {len(st.session_state.get('report_items', []))}."
         return "Todavía no tengo una respuesta previa sólida para agregar al informe."
 
     if final_report_requested(prompt):
         if not st.session_state.get("report_items"):
-            return "Aún no tengo puntos guardados para construir el informe final. Primero activa el modo informe o pídeme agregar respuestas específicas."
+            return "Aún no tengo puntos guardados para construir el informe final. Primero activa el modo informe o agrégame respuestas específicas."
         scope = st.session_state.get("report_goal", prompt)
-        report = llm_call(MODEL_REPORT, build_report_prompt(prompt, scope), low_latency=False, higher_reasoning=True)
+        report = llm_call(
+            MODEL_REPORT,
+            build_report_prompt(prompt, scope),
+            low_latency=False,
+            higher_reasoning=True,
+        )
         add_topic("informe")
         st.session_state.pending_report = False
         return report
 
-    if len(topics) >= 2 and not any(x in q for x in ["ventas", "clientes", "productos", "geograf", "medios", "retencion", "retención"]):
-        options = "
-".join([f"- {t}" for t in topics[-6:]])
+    if len(topics) >= 2 and not any(x in q for x in ["ventas", "clientes", "productos", "geograf", "medios", "retencion", "retención", "investig"]):
+        options = " ".join([f"- {t}" for t in topics[-6:]])
         st.session_state.pending_report = True
         return (
-            "Puedo hacerlo. Antes de generar el informe, dime sobre cuál de estos temas conversados lo quieres:
-
-"
-            f"{options}
-
-"
-            "También puedes pedírmelo cruzado, por ejemplo: ventas + productos, geografía + clientes, o medios + ventas."
+            "Puedo hacerlo. Antes de generar el informe, dime sobre cuál de estos temas conversados lo quieres: "
+            f"{options}  "
+            "También puedes pedírmelo cruzado, por ejemplo: ventas + productos, geografía + clientes, medios + ventas o investigación externa + datos internos."
         )
 
-    scope = prompt
-    report = llm_call(MODEL_REPORT, build_report_prompt(prompt, scope), low_latency=False, higher_reasoning=True)
-    add_topic("informe")
     st.session_state.pending_report = False
+    scope = prompt
+    report = llm_call(
+        MODEL_REPORT,
+        build_report_prompt(prompt, scope),
+        low_latency=False,
+        higher_reasoning=True,
+    )
+    add_topic("informe")
     return report
 
 
@@ -881,7 +1316,7 @@ def handle_report_request(prompt: str) -> str:
 # ============================================================
 st.set_page_config(page_title="NobleBotAI 🐷🐽", layout="wide")
 st.title("NobleBotAI 🐷🐽")
-st.caption("Inteligencia comercial, performance y marketing 360 para agencia")
+st.caption("Inteligencia comercial, performance, investigación y marketing 360 para agencia")
 
 with st.sidebar:
     st.header("Configuración")
@@ -892,10 +1327,15 @@ with st.sidebar:
     st.markdown(f"**Modelo Router:** `{MODEL_ROUTER}`")
     st.markdown(f"**Modelo Chat:** `{MODEL_CHAT}`")
     st.markdown(f"**Modelo Report:** `{MODEL_REPORT}`")
+    st.markdown(f"**Research externo:** `{'ON' if ENABLE_EXTERNAL_RESEARCH else 'OFF'}`")
 
     st.subheader("Mapa de Verdad")
     for alias, fq_table in MAPA_VERDAD.items():
         st.markdown(f"- **{alias}** → `{fq_table}`")
+
+    st.subheader("Entidades conocidas")
+    for alias, info in KNOWN_ENTITIES.items():
+        st.markdown(f"- **{alias}** → {info.get('description', '')}")
 
     st.subheader("Estado tablas oficiales")
     for alias, existe in diagnosticar_tablas().items():
@@ -904,8 +1344,8 @@ with st.sidebar:
     if st.button("Limpiar memoria"):
         for key in [
             "messages", "chat_memory", "last_sql", "last_df", "last_answer",
-            "last_route", "discussed_topics", "pending_report", "report_mode",
-            "report_items", "report_goal", "sql_cache"
+            "last_route", "last_intent", "discussed_topics", "pending_report", "report_mode",
+            "report_items", "report_goal", "sql_cache", "last_research_context"
         ]:
             st.session_state.pop(key, None)
         st.rerun()
@@ -914,7 +1354,8 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-prompt = st.chat_input("Pregúntame por clientes, ventas, productos, geografía, medios o informes...")
+prompt = st.chat_input("Pregúntame por clientes, ventas, productos, geografía, medios, investigación o informes...")
+
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -923,7 +1364,8 @@ if prompt:
     with st.chat_message("assistant"):
         try:
             route = classify_route(prompt)
-            st.session_state.last_route = route.intent
+            st.session_state.last_route = route.route
+            st.session_state.last_intent = route.intent
             add_topic(route.topic)
 
             if route.route == "smalltalk":
@@ -937,14 +1379,57 @@ if prompt:
             elif route.route == "chat" and not route.needs_bq:
                 answer = llm_call(
                     MODEL_CHAT,
-                    f"Responde de forma breve y útil. Mantén contexto del chat.\n\nMEMORIA:\n{summarize_memory()}\n\nPREGUNTA:\n{prompt}",
+                    f"""
+Responde de forma breve y útil. Mantén contexto del chat.
+
+MEMORIA:
+{summarize_memory()}
+
+ENTIDADES_CONOCIDAS:
+{known_entities_text()}
+
+PREGUNTA:
+{prompt}
+""",
                     low_latency=True,
                 )
                 st.markdown(answer)
 
-            elif route.intent == "informe" or st.session_state.get("pending_report") or report_mode_requested(prompt) or add_to_report_requested(prompt) or final_report_requested(prompt):
+            elif (
+                route.intent == "informe"
+                or report_mode_requested(prompt)
+                or add_to_report_requested(prompt)
+                or final_report_requested(prompt)
+                or (st.session_state.get("pending_report") and "informe" in lower_clean(prompt))
+            ):
                 answer = handle_report_request(prompt)
                 st.markdown(answer)
+
+            elif route.route == "research":
+                with st.spinner("Investigando fuentes externas..."):
+                    external_context = run_external_research(prompt)
+                    answer = llm_call(
+                        MODEL_CHAT,
+                        build_research_prompt(prompt, external_context),
+                        low_latency=False,
+                        higher_reasoning=True,
+                    )
+                    st.markdown(answer)
+
+                    st.session_state.last_sql = ""
+                    st.session_state.last_df = None
+
+                    if st.session_state.get("report_mode"):
+                        save_current_point_to_report(
+                            question=prompt,
+                            answer=answer,
+                            sql="",
+                            df=None,
+                            intent=route.intent,
+                        )
+
+                    with st.expander("Ver contexto externo usado"):
+                        st.text(external_context)
 
             else:
                 with st.spinner("Consultando tablas oficiales..."):
@@ -955,7 +1440,7 @@ if prompt:
                     st.session_state.last_sql = sql
                     st.session_state.last_df = df.copy()
 
-                    if add_to_report_requested(prompt):
+                    if st.session_state.get("report_mode"):
                         save_current_point_to_report(
                             question=prompt,
                             answer=answer,
@@ -977,7 +1462,7 @@ if prompt:
             error_message = (
                 "Hubo un problema técnico al construir o ejecutar la respuesta. "
                 "La lógica del agente sigue intacta, pero falló la ruta de ejecución. "
-                "Prueba con una pregunta más específica o revisa si el modelo y la ubicación de Vertex AI están configurados correctamente."
+                "Prueba con una pregunta más específica o revisa si el modelo, la ubicación de Vertex AI y las claves opcionales de investigación externa están configuradas correctamente."
             )
             st.markdown(error_message)
             st.session_state.messages.append({"role": "assistant", "content": error_message})
