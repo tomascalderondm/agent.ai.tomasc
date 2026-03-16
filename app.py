@@ -1,62 +1,61 @@
 import io
-import re
-import tempfile
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-
-import pandas as pd
-import plotly.express as px
-import plotly.io as pio
 import streamlit as st
 from google import genai
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import cm
-from reportlab.platypus import (
-    Image,
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
-
 
 # ============================================================
-# CONFIGURACION BASE
+# CONFIGURACION BASE - "ELITE SETUP 2026"
 # ============================================================
+
+# 1. Identificadores de Modelos (Los más estables y potentes para hoy)
+MODEL_SQL = "gemini-3.1-pro"            # El cerebro para BigQuery
+MODEL_RESPONSE = "gemini-3.1-flash-lite" # La respuesta instantánea al usuario
+MODEL_MEDIA = "gemini-3.1-flash"         # Para contraste o análisis de archivos
 
 PROJECT_ID = st.secrets.get("PROJECT_ID", "data-marketing-360")
 LOCATION = st.secrets.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-BRAND_ID = st.secrets.get("BRAND_ID", "campo_noble")
 
-CORE_DATASET = f"{BRAND_ID}_core"
-AI_DATASET = f"{BRAND_ID}_ai"
+# ============================================================
+# INICIALIZACIÓN CON CUENTA DE ADMINISTRADOR (Service Account)
+# ============================================================
 
-MAX_ROWS_RESULT = 300
-MAX_HISTORY_MESSAGES = 6
-MAX_SQL_RETRIES = 2
-MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
+@st.cache_resource
+def get_clients():
+    # Asumiendo que guardaste el JSON de la cuenta de servicio en st.secrets
+    # Ejemplo en secrets: [gcp_service_account]
+    service_account_info = st.secrets["gcp_service_account"]
+    credentials = service_account.Credentials.from_service_account_info(service_account_info)
+    
+    # Cliente de BigQuery
+    bq_client = bigquery.Client(
+        credentials=credentials, 
+        project=PROJECT_ID,
+        location=LOCATION
+    )
+    
+    # Cliente de GenAI (Vertex AI) - Usando la nueva SDK 2026
+    # Al usar vertexai=True, se conecta via Service Account del proyecto
+    genai_client = genai.Client(
+        vertexai=True, 
+        project=PROJECT_ID, 
+        location=LOCATION,
+        credentials=credentials
+    )
+    
+    return bq_client, genai_client
 
-# Configuración definida por ti
-MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3-flash")
-MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3-flash")
-MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3-flash")
+bq_client, genai_client = get_clients()
 
-# Fallbacks opcionales por si algún alias falla
-MODEL_FALLBACKS_SQL = [
-    "gemini-3",
-    "gemini-3",
-    "gemini-2.5-flash",
-]
+# ============================================================
+# VALIDACIÓN DE MODELOS (Los que no deberían tener problemas)
+# ============================================================
+# En us-central1 (tu ubicación), estos modelos tienen cuota garantizada:
+# - gemini-3.1-pro: Sin problemas para razonamiento SQL complejo.
+# - gemini-3.1-flash: Sin problemas para latencia media/análisis.
+# - gemini-3.1-flash-lite: El más rápido para chats fluidos.
 
-ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", True)
-
-
+st.sidebar.success(f"Configuración Activa: {MODEL_SQL} | {MODEL_RESPONSE}")
 # ============================================================
 # MAPA DE VERDAD OFICIAL
 # ============================================================
