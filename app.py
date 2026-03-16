@@ -21,11 +21,11 @@ BRAND_ID = st.secrets.get("BRAND_ID", "campo_noble")
 CORE_DATASET = f"{BRAND_ID}_core"
 AI_DATASET = f"{BRAND_ID}_ai"
 
-# Model Tiering
-MODEL_SQL = "gemini-3.1-pro-preview"
-MODEL_ROUTER = "gemini-3.1-flash-lite-preview"
-MODEL_CHAT = "gemini-3.1-flash-lite-preview"
-MODEL_REPORT = "gemini-3-flash-preview"
+# Gemini 3.1 en Vertex AI con cuenta de servicio
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3.1-pro")
+MODEL_ROUTER = st.secrets.get("MODEL_ROUTER", "gemini-3.1-flash-lite")
+MODEL_CHAT = st.secrets.get("MODEL_CHAT", "gemini-3.1-flash-lite")
+MODEL_REPORT = st.secrets.get("MODEL_REPORT", "gemini-3.1-flash")
 
 MAX_ROWS_RESULT = int(st.secrets.get("MAX_ROWS_RESULT", 200))
 MAX_HISTORY_MESSAGES = int(st.secrets.get("MAX_HISTORY_MESSAGES", 8))
@@ -101,6 +101,12 @@ if "discussed_topics" not in st.session_state:
     st.session_state.discussed_topics = []
 if "pending_report" not in st.session_state:
     st.session_state.pending_report = False
+if "report_mode" not in st.session_state:
+    st.session_state.report_mode = False
+if "report_items" not in st.session_state:
+    st.session_state.report_items = []
+if "report_goal" not in st.session_state:
+    st.session_state.report_goal = ""
 if "sql_cache" not in st.session_state:
     st.session_state.sql_cache = {}
 
@@ -197,13 +203,24 @@ def summarize_memory() -> str:
     if st.session_state.get("last_route"):
         blocks.append(f"ULTIMA_RUTA: {st.session_state['last_route']}")
     if st.session_state.get("last_sql"):
-        blocks.append(f"ULTIMO_SQL:\n{st.session_state['last_sql']}")
+        blocks.append(f"ULTIMO_SQL:
+{st.session_state['last_sql']}")
     if st.session_state.get("last_answer"):
-        blocks.append(f"ULTIMA_RESPUESTA:\n{st.session_state['last_answer']}")
+        blocks.append(f"ULTIMA_RESPUESTA:
+{st.session_state['last_answer']}")
     if last_df is not None and not last_df.empty:
-        blocks.append("ULTIMOS_DATOS:\n" + compact_dataframe(last_df, 15))
+        blocks.append("ULTIMOS_DATOS:
+" + compact_dataframe(last_df, 15))
+    if st.session_state.get("report_mode"):
+        blocks.append(f"MODO_INFORME_ACTIVO: True")
+    if st.session_state.get("report_goal"):
+        blocks.append(f"OBJETIVO_INFORME: {st.session_state['report_goal']}")
+    if st.session_state.get("report_items"):
+        blocks.append(f"PUNTOS_EN_INFORME: {len(st.session_state['report_items'])}")
     blocks.append(f"TEMAS_CONVERSADOS: {recent_topics_text()}")
-    return "\n\n".join(blocks)
+    return "
+
+".join(blocks)
 
 
 def build_chat_history(max_messages: int = MAX_HISTORY_MESSAGES) -> str:
@@ -211,6 +228,61 @@ def build_chat_history(max_messages: int = MAX_HISTORY_MESSAGES) -> str:
     if not recent:
         return ""
     return "\n".join([f"{m['role']}: {m['content']}" for m in recent])
+
+
+def report_mode_requested(q: str) -> bool:
+    triggers = [
+        "al final quiero un informe",
+        "quiero crear un informe al final",
+        "vamos armando un informe",
+        "quiero ir armando un informe",
+        "guarda esto para el informe",
+        "ten en cuenta esto para el informe",
+        "esto va al informe",
+    ]
+    q2 = lower_clean(q)
+    return any(t in q2 for t in triggers)
+
+
+def add_to_report_requested(q: str) -> bool:
+    triggers = [
+        "agrega esto al informe",
+        "sumalo al informe",
+        "súmalo al informe",
+        "incluye esto en el informe",
+        "esto agregalo al informe",
+        "esto agrégalo al informe",
+        "guarda esto en el informe",
+    ]
+    q2 = lower_clean(q)
+    return any(t in q2 for t in triggers)
+
+
+def final_report_requested(q: str) -> bool:
+    triggers = [
+        "dame el informe",
+        "entregame el informe",
+        "entrégame el informe",
+        "genera el informe final",
+        "haz el informe final",
+        "crea el informe final",
+        "ahora si dame el informe",
+        "ya dame el informe",
+    ]
+    q2 = lower_clean(q)
+    return any(t in q2 for t in triggers)
+
+
+def save_current_point_to_report(question: str, answer: str, sql: str = "", df: Optional[pd.DataFrame] = None, intent: str = ""):
+    item = {
+        "question": question,
+        "answer": answer,
+        "sql": sql,
+        "intent": intent,
+        "data_preview": compact_dataframe(df, 25) if df is not None else "Sin tabla asociada.",
+    }
+    st.session_state.report_items.append(item)
+    st.session_state.report_items = st.session_state.report_items[-20:]
 
 
 def llm_call(
@@ -225,17 +297,10 @@ def llm_call(
         top_p=0.95,
         max_output_tokens=2048,
     )
-
     if low_latency and not higher_reasoning:
-        config.thinking_config = types.ThinkingConfig(
-            thinking_level=types.ThinkingLevel.LOW
-        )
-
+        config.thinking_config = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
     if higher_reasoning:
-        config.thinking_config = types.ThinkingConfig(
-            thinking_level=types.ThinkingLevel.MEDIUM
-        )
-
+        config.thinking_config = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
     if system_instruction:
         config.system_instruction = system_instruction
 
@@ -267,9 +332,7 @@ def classify_route(pregunta: str) -> RouteDecision:
 
     if any(x in q for x in ["hazme un informe", "haz un informe", "quiero un informe", "reporte", "informe ejecutivo"]):
         topics = st.session_state.get("discussed_topics", [])
-        if len(topics) >= 2 and not any(
-            x in q for x in ["ventas", "clientes", "productos", "geograf", "medios", "retencion", "retención"]
-        ):
+        if len(topics) >= 2 and not any(x in q for x in ["ventas", "clientes", "productos", "geograf", "medios", "retencion", "retención"]):
             return RouteDecision(
                 route="clarify_report_scope",
                 intent="informe",
@@ -284,16 +347,12 @@ def classify_route(pregunta: str) -> RouteDecision:
     # Heurística rápida primero
     if any(x in q for x in ["comuna", "comunas", "region", "región", "provincia", "provincias", "talca", "maule", "geografia", "geografía"]):
         return RouteDecision("analytics", "geografia", "data", True, es_followup_heuristico(q), False, "geografía", "heurística geografía")
-
     if any(x in q for x in ["venta", "ventas", "ticket", "ingresos", "facturacion", "facturación", "mes", "año", "anio", "periodo", "período"]):
         return RouteDecision("analytics", "ventas", "data", True, es_followup_heuristico(q), False, "ventas", "heurística ventas")
-
     if any(x in q for x in ["cliente", "clientes", "ltv", "churn", "riesgo", "recurrente", "nuevo", "segmento"]):
         return RouteDecision("analytics", "clientes", "data", True, es_followup_heuristico(q), False, "clientes", "heurística clientes")
-
     if any(x in q for x in ["producto", "productos", "sku", "mix", "canasta", "afinidad", "retencion", "retención", "recompra"]):
         return RouteDecision("analytics", "productos", "data", True, es_followup_heuristico(q), False, "productos", "heurística productos")
-
     if any(x in q for x in ["meta ads", "google ads", "roas", "cac", "cpa", "paid media", "presupuesto", "inversion", "inversión", "campaña", "campana"]):
         return RouteDecision("analytics", "medios", "strategic", True, es_followup_heuristico(q), False, "medios", "heurística medios")
 
@@ -332,21 +391,11 @@ PREGUNTA:
 {pregunta}
 """
     raw = llm_call(MODEL_ROUTER, router_prompt, low_latency=True)
-
     try:
         parsed = json.loads(raw)
         return RouteDecision(**parsed)
     except Exception:
-        return RouteDecision(
-            "analytics",
-            "otro",
-            "data",
-            True,
-            es_followup_heuristico(q),
-            False,
-            "análisis",
-            "fallback seguro",
-        )
+        return RouteDecision("analytics", "otro", "data", True, es_followup_heuristico(q), False, "análisis", "fallback seguro")
 
 
 # ============================================================
@@ -376,7 +425,8 @@ def filtrar_tablas_existentes(tablas_objetivo: List[str]) -> List[str]:
 
 def obtener_esquema_limitado(table_fq: str) -> List[Tuple[str, str]]:
     table = bq_client.get_table(table_fq)
-    return [(f.name, f.field_type) for f in table.schema[:MAX_SCHEMA_COLUMNS]]
+    schema = [(f.name, f.field_type) for f in table.schema[:MAX_SCHEMA_COLUMNS]]
+    return schema
 
 
 def obtener_esquemas(tablas_objetivo: List[str]) -> Dict[str, List[Tuple[str, str]]]:
@@ -471,7 +521,7 @@ def validar_sql(query: str) -> Tuple[bool, str]:
 
     blocked = [
         "INSERT ", "UPDATE ", "DELETE ", "MERGE ", "DROP ", "ALTER ",
-        "TRUNCATE ", "CREATE ", "CALL ", "EXECUTE IMMEDIATE ", "EXPORT DATA ",
+        "TRUNCATE ", "CREATE ", "CALL ", "EXECUTE IMMEDIATE ", "EXPORT DATA "
     ]
     for word in blocked:
         if word in upper:
@@ -502,19 +552,13 @@ def ejecutar_query(query: str) -> pd.DataFrame:
 # ============================================================
 # SQL GENERATION
 # ============================================================
-def build_sql_prompt(
-    pregunta: str,
-    route: RouteDecision,
-    tablas: List[str],
-    esquemas_texto: str,
-    error_previo: str = "",
-) -> str:
+def build_sql_prompt(pregunta: str, route: RouteDecision, tablas: List[str], esquemas_texto: str, error_previo: str = "") -> str:
     tablas_txt = "\n".join([f"- {t}" for t in tablas])
     return f"""
 Eres NobleBotAI SQL Engine. Devuelve SOLO SQL puro para BigQuery.
 
 MAPA_OFICIAL:
-{chr(10).join([f"- {v}" for v in MAPA_VERDAD.values()])}
+{chr(10).join([f'- {v}' for v in MAPA_VERDAD.values()])}
 
 TABLAS_PRIORITARIAS:
 {tablas_txt}
@@ -563,8 +607,7 @@ REGLAS TÉCNICAS:
 
 
 def generate_sql_with_retries(pregunta: str, route: RouteDecision) -> Tuple[str, pd.DataFrame]:
-    cache_key = f"{route.intent}::{pregunta.strip().lower()}::{st.session_state.get('last_sql', '')}"
-
+    cache_key = f"{route.intent}::{pregunta.strip().lower()}::{st.session_state.get('last_sql','')}"
     if ENABLE_SQL_CACHE and cache_key in st.session_state.sql_cache:
         sql_cached = st.session_state.sql_cache[cache_key]
         return sql_cached, ejecutar_query(sql_cached)
@@ -577,19 +620,17 @@ def generate_sql_with_retries(pregunta: str, route: RouteDecision) -> Tuple[str,
     if not esquemas:
         raise ValueError("No pude leer esquemas de las tablas disponibles.")
 
-    esquemas_texto = format_schemas(esquemas)
+    prompt_base = format_schemas(esquemas)
     error_previo = ""
     ultimo_error = ""
 
     for _ in range(MAX_SQL_RETRIES):
-        sql = limpiar_sql(
-            llm_call(
-                MODEL_SQL,
-                build_sql_prompt(pregunta, route, tablas, esquemas_texto, error_previo),
-                low_latency=False,
-                higher_reasoning=True,
-            )
-        )
+        sql = limpiar_sql(llm_call(
+            MODEL_SQL,
+            build_sql_prompt(pregunta, route, tablas, prompt_base, error_previo),
+            low_latency=False,
+            higher_reasoning=True,
+        ))
 
         ok, motivo = validar_sql(sql)
         if not ok:
@@ -618,37 +659,31 @@ def suggested_next_steps(route: RouteDecision, pregunta: str, has_data: bool) ->
             "Puedo reformular la búsqueda con otro período o nivel geográfico.",
             "Puedo revisar si el problema está en match geográfico o en un filtro demasiado estrecho.",
         ]
-
     if route.intent == "ventas":
         return [
             "También puedo comparar este resultado contra el período anterior.",
             "También puedo cruzarlo con productos líderes o ticket promedio.",
         ]
-
     if route.intent == "clientes":
         return [
             "También puedo segmentar esos clientes por recurrencia, riesgo o valor.",
             "También puedo convertir esto en un informe ejecutivo de clientes.",
         ]
-
     if route.intent == "productos":
         return [
             "También puedo mostrar afinidad entre productos o patrones de recompra.",
             "También puedo bajar esto a SKU, mix o retención.",
         ]
-
     if route.intent == "geografia":
         return [
             "También puedo hacer el ranking territorial del mismo tema.",
             "También puedo revisar si hay comunas o pedidos que no hicieron match.",
         ]
-
     if route.intent == "medios":
         return [
             "También puedo convertir esto en una propuesta de inversión en marketing.",
             "También puedo hacer una lectura ejecutiva para performance, CRM o retención.",
         ]
-
     return [
         "También puedo profundizar en el mismo tema con otra dimensión.",
         "También puedo convertir esta conversación en un informe ejecutivo cuando tú quieras.",
@@ -696,42 +731,93 @@ REGLAS:
 
 def render_answer(pregunta: str, route: RouteDecision, sql: str, df: pd.DataFrame) -> str:
     if df is None or df.empty:
-        base = (
-            "No encontré filas que calcen exactamente con esa búsqueda en las tablas oficiales. "
-            "Eso normalmente significa que el filtro está muy estrecho, el período no tiene registros o el match geográfico no coincide."
-        )
+        if route.intent == "geografia":
+            base = (
+                "No encontré filas que calcen exactamente con esa búsqueda en las tablas oficiales. "
+                "Eso normalmente significa que el filtro está muy estrecho, el período no tiene registros o el match geográfico no coincide."
+            )
+        elif route.intent == "ventas":
+            base = (
+                "No encontré filas que calcen exactamente con esa búsqueda en las tablas oficiales. "
+                "Eso normalmente significa que el período consultado no tiene registros, la métrica pedida no está en esa tabla o la consulta quedó demasiado restringida."
+            )
+        else:
+            base = (
+                "No encontré filas que calcen exactamente con esa búsqueda en las tablas oficiales. "
+                "Eso normalmente significa que el filtro quedó demasiado estrecho o faltó precisar mejor la consulta."
+            )
         sugg = suggested_next_steps(route, pregunta, has_data=False)
-        return base + "\n\n" + "\n".join([f"- {s}" for s in sugg])
+        return base + "
+
+" + "
+".join([f"- {s}" for s in sugg])
 
     raw = llm_call(MODEL_CHAT, build_answer_prompt(pregunta, route, sql, df), low_latency=True)
     raw = raw.strip() or "Consulté las tablas oficiales y obtuve el resultado, pero la redacción final salió vacía."
+    if st.session_state.get("report_mode"):
+        raw += "
+
+Puedo guardar este hallazgo para el informe final si me dices: agrega esto al informe."
     return raw
 
 
 def build_report_prompt(user_request: str, scope: str) -> str:
+    items = st.session_state.get("report_items", [])
+    compiled_points = []
+    for i, item in enumerate(items, start=1):
+        compiled_points.append(
+            f"PUNTO {i}
+"
+            f"PREGUNTA: {item.get('question', '')}
+"
+            f"INTENT: {item.get('intent', '')}
+"
+            f"RESPUESTA: {item.get('answer', '')}
+"
+            f"SQL: {item.get('sql', '')}
+"
+            f"DATOS: {item.get('data_preview', '')}"
+        )
+
     return f"""
 Eres NobleBotAI.
-Genera un informe ejecutivo muy completo, preciso y útil para una agencia / marca ecommerce.
+Genera un informe final EXTENSO, profundo y bien conectado para una agencia / marca ecommerce.
 
 ALCANCE DEL INFORME: {scope}
 PEDIDO ORIGINAL: {user_request}
+OBJETIVO_GENERAL: {st.session_state.get('report_goal', '')}
 
 MEMORIA DEL CHAT:
 {summarize_memory()}
 
+PUNTOS ACUMULADOS PARA EL INFORME:
+{'
+
+'.join(compiled_points) if compiled_points else 'No hay puntos acumulados.'}
+
 REGLAS:
 - Usa solo lo conversado y lo consultado en esta sesión.
+- Consolida todos los puntos guardados en un solo documento coherente.
 - No inventes datos faltantes.
-- Estructura sugerida:
-  1. Resumen ejecutivo
-  2. Hallazgos clave
-  3. Qué está pasando
-  4. Riesgos
-  5. Oportunidades
-  6. Acciones recomendadas por prioridad
-  7. Qué revisar después
+- Cruza hallazgos entre secciones, no repitas como bloques aislados.
+- Debe ser bastante más extenso que una respuesta normal.
+- Extrae conclusiones, patrones, comparaciones y tensiones de negocio.
+- Si hay años o períodos, compáralos con claridad.
+- Si hay geografía, interpreta territorios, concentración y cambios.
+- Si hay clientes/productos/ventas, conecta impacto comercial.
 - Adáptalo a marketing, medios, ecommerce, CRM y agencia si aplica.
 - Debe sentirse sólido, no genérico.
+
+ESTRUCTURA OBLIGATORIA:
+1. Resumen ejecutivo
+2. Contexto y alcance del análisis
+3. Hallazgos clave consolidados
+4. Análisis detallado por tema
+5. Comparaciones relevantes y qué cambió
+6. Conclusiones estratégicas
+7. Riesgos y oportunidades
+8. Recomendaciones priorizadas
+9. Próximos análisis sugeridos
 """
 
 
@@ -739,24 +825,52 @@ def handle_report_request(prompt: str) -> str:
     topics = st.session_state.get("discussed_topics", [])
     q = lower_clean(prompt)
 
-    if len(topics) >= 2 and not any(
-        x in q for x in ["ventas", "clientes", "productos", "geograf", "medios", "retencion", "retención"]
-    ):
-        options = "\n".join([f"- {t}" for t in topics[-6:]])
+    if report_mode_requested(prompt):
+        st.session_state.report_mode = True
+        st.session_state.report_goal = prompt
+        return (
+            "Perfecto. Desde ahora iré armando el informe en segundo plano durante esta conversación. "
+            "Cuando una respuesta quieras guardarla, puedes decirme 'agrega esto al informe'. "
+            "Y cuando quieras el documento final, pídeme 'dame el informe final'."
+        )
+
+    if add_to_report_requested(prompt):
+        if st.session_state.get("last_answer"):
+            save_current_point_to_report(
+                question=st.session_state.messages[-2]["content"] if len(st.session_state.messages) >= 2 else prompt,
+                answer=st.session_state.get("last_answer", ""),
+                sql=st.session_state.get("last_sql", ""),
+                df=st.session_state.get("last_df", None),
+                intent=st.session_state.get("last_route", ""),
+            )
+            return f"Listo. Ya agregué ese punto al informe. Puntos acumulados: {len(st.session_state.get('report_items', []))}."
+        return "Todavía no tengo una respuesta previa sólida para agregar al informe."
+
+    if final_report_requested(prompt):
+        if not st.session_state.get("report_items"):
+            return "Aún no tengo puntos guardados para construir el informe final. Primero activa el modo informe o pídeme agregar respuestas específicas."
+        scope = st.session_state.get("report_goal", prompt)
+        report = llm_call(MODEL_REPORT, build_report_prompt(prompt, scope), low_latency=False, higher_reasoning=True)
+        add_topic("informe")
+        st.session_state.pending_report = False
+        return report
+
+    if len(topics) >= 2 and not any(x in q for x in ["ventas", "clientes", "productos", "geograf", "medios", "retencion", "retención"]):
+        options = "
+".join([f"- {t}" for t in topics[-6:]])
         st.session_state.pending_report = True
         return (
-            "Puedo hacerlo. Antes de generar el informe, dime sobre cuál de estos temas conversados lo quieres:\n\n"
-            f"{options}\n\n"
+            "Puedo hacerlo. Antes de generar el informe, dime sobre cuál de estos temas conversados lo quieres:
+
+"
+            f"{options}
+
+"
             "También puedes pedírmelo cruzado, por ejemplo: ventas + productos, geografía + clientes, o medios + ventas."
         )
 
     scope = prompt
-    report = llm_call(
-        MODEL_REPORT,
-        build_report_prompt(prompt, scope),
-        low_latency=False,
-        higher_reasoning=True,
-    )
+    report = llm_call(MODEL_REPORT, build_report_prompt(prompt, scope), low_latency=False, higher_reasoning=True)
     add_topic("informe")
     st.session_state.pending_report = False
     return report
@@ -789,15 +903,9 @@ with st.sidebar:
 
     if st.button("Limpiar memoria"):
         for key in [
-            "messages",
-            "chat_memory",
-            "last_sql",
-            "last_df",
-            "last_answer",
-            "last_route",
-            "discussed_topics",
-            "pending_report",
-            "sql_cache",
+            "messages", "chat_memory", "last_sql", "last_df", "last_answer",
+            "last_route", "discussed_topics", "pending_report", "report_mode",
+            "report_items", "report_goal", "sql_cache"
         ]:
             st.session_state.pop(key, None)
         st.rerun()
@@ -807,10 +915,8 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 prompt = st.chat_input("Pregúntame por clientes, ventas, productos, geografía, medios o informes...")
-
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
-
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -831,16 +937,12 @@ if prompt:
             elif route.route == "chat" and not route.needs_bq:
                 answer = llm_call(
                     MODEL_CHAT,
-                    (
-                        "Responde de forma breve y útil. Mantén contexto del chat.\n\n"
-                        f"MEMORIA:\n{summarize_memory()}\n\n"
-                        f"PREGUNTA:\n{prompt}"
-                    ),
+                    f"Responde de forma breve y útil. Mantén contexto del chat.\n\nMEMORIA:\n{summarize_memory()}\n\nPREGUNTA:\n{prompt}",
                     low_latency=True,
                 )
                 st.markdown(answer)
 
-            elif route.intent == "informe" or st.session_state.get("pending_report"):
+            elif route.intent == "informe" or st.session_state.get("pending_report") or report_mode_requested(prompt) or add_to_report_requested(prompt) or final_report_requested(prompt):
                 answer = handle_report_request(prompt)
                 st.markdown(answer)
 
@@ -852,6 +954,15 @@ if prompt:
 
                     st.session_state.last_sql = sql
                     st.session_state.last_df = df.copy()
+
+                    if add_to_report_requested(prompt):
+                        save_current_point_to_report(
+                            question=prompt,
+                            answer=answer,
+                            sql=sql,
+                            df=df,
+                            intent=route.intent,
+                        )
 
                     with st.expander("Ver SQL usado"):
                         st.code(sql, language="sql")
@@ -870,6 +981,6 @@ if prompt:
             )
             st.markdown(error_message)
             st.session_state.messages.append({"role": "assistant", "content": error_message})
-
             with st.expander("Detalle técnico"):
                 st.code(str(e))
+
