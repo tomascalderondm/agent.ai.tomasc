@@ -42,15 +42,28 @@ MAX_HISTORY_MESSAGES = 6
 MAX_SQL_RETRIES = 2
 MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
 
-# Gemini 3 Flash existe en Vertex AI; dejamos fallback por seguridad.
-MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3-flash")
-MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3-flash")
-MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3-flash")
+# Configuración definida por ti
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3.1-pro")
+MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3.1-flash-lite")
+MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3.1-flash")
 
-MODEL_FALLBACKS = [
+# Fallbacks opcionales por si algún alias falla
+MODEL_FALLBACKS_SQL = [
+    "gemini-3.1-pro",
     "gemini-3-flash",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
+]
+
+MODEL_FALLBACKS_RESPONSE = [
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+]
+
+MODEL_FALLBACKS_MEDIA = [
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
 ]
 
 ENABLE_EXTERNAL_CORROBORATION = st.secrets.get("ENABLE_EXTERNAL_CORROBORATION", True)
