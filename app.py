@@ -26,6 +26,12 @@ from reportlab.platypus import (
 )
 
 # ============================================================
+# PAGE CONFIG (debe ir antes de otros elementos visuales de Streamlit)
+# ============================================================
+
+st.set_page_config(page_title="NobleBotAI 🐷🐽", layout="wide")
+
+# ============================================================
 # CONFIGURACION BASE
 # ============================================================
 
@@ -41,82 +47,35 @@ MAX_HISTORY_MESSAGES = 6
 MAX_SQL_RETRIES = 2
 MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
 
-MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-2.5-flash")
-MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-2.5-flash")
-MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-2.5-flash")
+# Modelo principal en Gemini 3 Flash
+MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3-flash")
+MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3-flash")
+MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3-flash")
+
+# Fallbacks robustos
+MODEL_FALLBACKS_SQL = [
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+]
+
+MODEL_FALLBACKS_RESPONSE = [
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+]
+
+MODEL_FALLBACKS_MEDIA = [
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+]
 
 ENABLE_EXTERNAL_CORROBORATION = st.secrets.get(
     "ENABLE_EXTERNAL_CORROBORATION",
     True,
 )
 
-# ============================================================
-# CLIENTES Y AUTENTICACIÓN (Cuenta de Administrador)
-# ============================================================
-
-def get_clients():
-    # Se asume que el JSON de la Service Account está en st.secrets["gcp_service_account"]
-    info = st.secrets["gcp_service_account"]
-    credentials = service_account.Credentials.from_service_account_info(info)
-    
-    # Cliente de BigQuery con credenciales de administrador
-    bq_client = bigquery.Client(
-        credentials=credentials,
-        project=PROJECT_ID,
-        location=LOCATION
-    )
-    
-    # Cliente de Google GenAI (Vertex AI habilitado)
-    genai_client = genai.Client(
-        vertexai=True,
-        project=PROJECT_ID,
-        location=LOCATION,
-        credentials=credentials
-    )
-    
-    return bq_client, genai_client
-
-bq_client, genai_client = get_clients()
-# ============================================================
-# INICIALIZACIÓN CON CUENTA DE ADMINISTRADOR (Service Account)
-# ============================================================
-
-@st.cache_resource
-def get_clients():
-    # Asumiendo que guardaste el JSON de la cuenta de servicio en st.secrets
-    # Ejemplo en secrets: [gcp_service_account]
-    service_account_info = st.secrets["gcp_service_account"]
-    credentials = service_account.Credentials.from_service_account_info(service_account_info)
-    
-    # Cliente de BigQuery
-    bq_client = bigquery.Client(
-        credentials=credentials, 
-        project=PROJECT_ID,
-        location=LOCATION
-    )
-    
-    # Cliente de GenAI (Vertex AI) - Usando la nueva SDK 2026
-    # Al usar vertexai=True, se conecta via Service Account del proyecto
-    genai_client = genai.Client(
-        vertexai=True, 
-        project=PROJECT_ID, 
-        location=LOCATION,
-        credentials=credentials
-    )
-    
-    return bq_client, genai_client
-
-bq_client, genai_client = get_clients()
-
-# ============================================================
-# VALIDACIÓN DE MODELOS (Los que no deberían tener problemas)
-# ============================================================
-# En us-central1 (tu ubicación), estos modelos tienen cuota garantizada:
-# - gemini-3.1-pro: Sin problemas para razonamiento SQL complejo.
-# - gemini-3.1-flash: Sin problemas para latencia media/análisis.
-# - gemini-3.1-flash-lite: El más rápido para chats fluidos.
-
-st.sidebar.success(f"Configuración Activa: {MODEL_SQL} | {MODEL_RESPONSE}")
 # ============================================================
 # MAPA DE VERDAD OFICIAL
 # ============================================================
@@ -151,30 +110,35 @@ MAPA_VERDAD: Dict[str, str] = {
 
 ALLOWED_TABLES = set(MAPA_VERDAD.values())
 
-
 # ============================================================
-# CREDENCIALES Y CLIENTES
+# CLIENTES Y AUTENTICACION
 # ============================================================
 
-creds_dict = dict(st.secrets["gcp_service_account"])
+@st.cache_resource
+def get_clients():
+    service_account_info = dict(st.secrets["gcp_service_account"])
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
 
-creds = service_account.Credentials.from_service_account_info(
-    creds_dict,
-    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-)
+    bq = bigquery.Client(
+        credentials=credentials,
+        project=PROJECT_ID,
+        location=LOCATION,
+    )
 
-bq_client = bigquery.Client(
-    credentials=creds,
-    project=PROJECT_ID,
-)
+    gx = genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location=LOCATION,
+        credentials=credentials,
+    )
 
-genai_client = genai.Client(
-    vertexai=True,
-    project=PROJECT_ID,
-    location=LOCATION,
-    credentials=creds,
-)
+    return bq, gx
 
+
+bq_client, genai_client = get_clients()
 
 # ============================================================
 # UTILIDADES GENERALES
@@ -198,8 +162,12 @@ def resumir_dataframe_para_prompt(df: pd.DataFrame, max_rows: int = 60) -> str:
     return df.head(max_rows).to_string(index=False)
 
 
-def generar_contenido_con_fallback(prompt: str, preferred_model: str):
-    candidatos = [preferred_model] + [m for m in MODEL_FALLBACKS if m != preferred_model]
+def generar_contenido_con_fallback(
+    prompt: str,
+    preferred_model: str,
+    fallback_models: List[str],
+):
+    candidatos = [preferred_model] + [m for m in fallback_models if m != preferred_model]
     ultimo_error = None
 
     for model_name in candidatos:
@@ -214,7 +182,9 @@ def generar_contenido_con_fallback(prompt: str, preferred_model: str):
             ultimo_error = e
             continue
 
-    raise ValueError(f"No pude generar contenido con ningún modelo Gemini configurado. Último error: {ultimo_error}")
+    raise ValueError(
+        f"No pude generar contenido con ningún modelo Gemini configurado. Último error: {ultimo_error}"
+    )
 
 
 def es_pregunta_medios_o_inversion(pregunta_usuario: str) -> bool:
@@ -295,7 +265,7 @@ def es_followup_de_respuesta_anterior(pregunta_usuario: str) -> bool:
 
 
 # ============================================================
-# NUEVAS FUNCIONES GEOGRÁFICAS CRÍTICAS
+# NUEVAS FUNCIONES GEOGRAFICAS CRITICAS
 # ============================================================
 
 def es_pregunta_geografica(pregunta_usuario: str) -> bool:
@@ -486,7 +456,11 @@ NUEVA_PREGUNTA:
 {pregunta_usuario}
 """
     try:
-        response = generar_contenido_con_fallback(prompt, MODEL_RESPONSE)
+        response = generar_contenido_con_fallback(
+            prompt,
+            MODEL_RESPONSE,
+            MODEL_FALLBACKS_RESPONSE,
+        )
         texto = obtener_texto_modelo(response).strip().upper()
         return "FOLLOWUP" in texto
     except Exception:
@@ -914,7 +888,11 @@ def generar_sql_con_reintentos(pregunta_usuario: str, historial_contexto: str) -
             error_previo=error_previo,
         )
 
-        respuesta_sql = generar_contenido_con_fallback(prompt_sql, MODEL_SQL)
+        respuesta_sql = generar_contenido_con_fallback(
+            prompt_sql,
+            MODEL_SQL,
+            MODEL_FALLBACKS_SQL,
+        )
 
         query_limpio = limpiar_sql(obtener_texto_modelo(respuesta_sql))
         ultimo_sql_generado = query_limpio
@@ -965,7 +943,11 @@ def responder_como_noblebot(
         num_filas=len(df_datos),
     )
 
-    respuesta_final = generar_contenido_con_fallback(prompt_final, MODEL_RESPONSE)
+    respuesta_final = generar_contenido_con_fallback(
+        prompt_final,
+        MODEL_RESPONSE,
+        MODEL_FALLBACKS_RESPONSE,
+    )
     texto = obtener_texto_modelo(respuesta_final).strip()
 
     if not texto:
@@ -1165,7 +1147,6 @@ def build_pdf_bytes() -> bytes:
 # SESSION STATE
 # ============================================================
 
-st.set_page_config(page_title="NobleBotAI 🐷🐽", layout="wide")
 st.title("NobleBotAI 🐷🐽")
 st.caption("Inteligencia comercial, performance y marketing 360 para agencia")
 
@@ -1203,6 +1184,7 @@ with st.sidebar:
     st.markdown(f"**Modelo SQL:** `{MODEL_SQL}`")
     st.markdown(f"**Modelo respuesta:** `{MODEL_RESPONSE}`")
     st.markdown(f"**Modelo contraste externo:** `{MODEL_MEDIA}`")
+    st.success(f"Configuración activa: {MODEL_SQL} | {MODEL_RESPONSE}")
 
     st.subheader("Mapa de Verdad")
     for alias, fq_table in MAPA_VERDAD.items():
@@ -1246,9 +1228,6 @@ if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas
 
     with st.chat_message("assistant"):
         try:
-            # --------------------------------------------------------
-            # GRAFICO ON-DEMAND
-            # --------------------------------------------------------
             if es_solicitud_grafico(prompt):
                 df_chart = st.session_state.get("last_df", None)
 
@@ -1287,9 +1266,6 @@ if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas
 
                         st.session_state.messages.append({"role": "assistant", "content": respuesta})
 
-            # --------------------------------------------------------
-            # PDF ON-DEMAND
-            # --------------------------------------------------------
             elif es_solicitud_pdf(prompt):
                 pdf_bytes = build_pdf_bytes()
                 respuesta = (
@@ -1305,9 +1281,6 @@ if prompt := st.chat_input("Pregúntame por clientes, ventas, productos, comunas
                 )
                 st.session_state.messages.append({"role": "assistant", "content": respuesta})
 
-            # --------------------------------------------------------
-            # FLUJO ANALITICO NORMAL
-            # --------------------------------------------------------
             else:
                 with st.spinner("NobleBotAI está consultando las tablas oficiales..."):
                     memoria_reciente = construir_contexto_historial(
