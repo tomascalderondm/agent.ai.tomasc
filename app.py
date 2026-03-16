@@ -44,25 +44,13 @@ MAX_BYTES_BILLED = 5 * 1024 * 1024 * 1024  # 5 GB
 
 # Configuración definida por ti
 MODEL_SQL = st.secrets.get("MODEL_SQL", "gemini-3-flash")
-MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3-flash-lite")
+MODEL_RESPONSE = st.secrets.get("MODEL_RESPONSE", "gemini-3-flash")
 MODEL_MEDIA = st.secrets.get("MODEL_MEDIA", "gemini-3-flash")
 
 # Fallbacks opcionales por si algún alias falla
 MODEL_FALLBACKS_SQL = [
-    "gemini-3-pro",
-    "gemini-3-flash-lite",
-    "gemini-2.5-flash",
-]
-
-MODEL_FALLBACKS_RESPONSE = [
-    "gemini-3-flash-lite",
-    "gemini-3-flash",
-    "gemini-2.5-flash",
-]
-
-MODEL_FALLBACKS_MEDIA = [
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite",
+    "gemini-3",
+    "gemini-3",
     "gemini-2.5-flash",
 ]
 
